@@ -32,13 +32,16 @@ Clone the repository
 bash
 git clone https://github.com/anpi0316/wz-telegram-bot.git
 cd wz-telegram-bot
+
 Create virtual environment
 bash
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
 Install dependencies
 bash
 pip install -r requirements.txt
+
 Create your bot on Telegram
 Message @BotFather on Telegram
 Send /newbot and follow instructions
@@ -48,11 +51,12 @@ Add your bot to the group
 Send any message in the group
 Visit: https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
 Find chat.id (negative number for groups)
+
 Configure environment variables
 Create a .env file or export directly:
 bash
 export BOT_TOKEN="your_bot_token_here"
-export CHAT_ID="-1001234567890"
+export CHAT_ID="XXXXXXX"
 export POLL_TIME="12:00"  # Optional, defaults to 12:00
 Run the bot locally
 bash
