@@ -7,10 +7,19 @@ from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
-TOKEN = os.environ.get("BOT_TOKEN")  # Токен будет на Render
-CHAT_ID = int(os.environ.get("CHAT_ID", 0))  # ID группы (преобразуем в число)
-ВРЕМЯ_ОТПРАВКИ = time(hour=12, minute=0, tzinfo=timezone('Europe/Moscow'))  # Можно тоже вынести в переменные при желании
+TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = int(os.environ.get("CHAT_ID", 0))
+ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "12:00")  # По умолчанию 12:00
 # ======================================================
+
+# Преобразуем строку "12:00" в time(hour=12, minute=0)
+try:
+    час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
+    ВРЕМЯ_ОТПРАВКИ = time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
+except:
+    # Если ошибка в формате, ставим 12:00
+    ВРЕМЯ_ОТПРАВКИ = time(hour=12, minute=0, tzinfo=timezone('Europe/Moscow'))
+    logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 12:00")
 
 # Проверка, что переменные загружены
 if not TOKEN:
@@ -42,8 +51,8 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     await update.message.reply_text(
-        "👋 Бот для ежедневных опросов!\n"
-        "Каждый день в 12:00 будет опрос 'Сегодня играем в WZ?'"
+        f"👋 Бот для ежедневных опросов!\n"
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос 'Сегодня играем в WZ?'"
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -59,7 +68,7 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Ошибка: {e}")
 
 if __name__ == "__main__":
-    logger.info("🚀 Запуск бота...")
+    logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
     
     # Создаём приложение
     application = Application.builder().token(TOKEN).build()
