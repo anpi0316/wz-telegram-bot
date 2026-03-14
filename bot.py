@@ -1,14 +1,36 @@
 import os
 import logging
+import threading
 from datetime import time
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from pytz import timezone
 
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
+# ========== ПРОСТОЙ HTTP-СЕРВЕР ДЛЯ RENDER ==========
+class SimpleHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+    
+    def log_message(self, format, *args):
+        # Отключаем логирование HTTP-сервера (чтобы не засорять логи)
+        pass
+
+def run_http_server():
+    server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
+    server.serve_forever()
+
+# Запускаем HTTP-сервер в отдельном потоке (daemon=True значит,
+# что он автоматически завершится при остановке бота)
+threading.Thread(target=run_http_server, daemon=True).start()
+# ====================================================
+
 # ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
-TOKEN = os.environ.get("BOT_TOKEN")
-CHAT_ID = int(os.environ.get("CHAT_ID", 0))
+TOKEN = os.environ.get("BOT_TOKEN")  # Токен из переменных окружения
+CHAT_ID = int(os.environ.get("CHAT_ID", 0))  # ID группы (преобразуем в число)
 ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "12:00")  # По умолчанию 12:00
 # ======================================================
 
@@ -85,7 +107,7 @@ if __name__ == "__main__":
         days=tuple(range(7))  # Все дни недели
     )
     
-    logger.info("🚀 Бот запущен и готов к работе!")
+    logger.info("🚀 Бот запущен и готов к работе! HTTP-сервер слушает порт 10000")
     
-    # Запускаем бота
+    # Запускаем бота (polling mode)
     application.run_polling()
