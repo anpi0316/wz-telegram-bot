@@ -62,7 +62,7 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_poll(
             chat_id=CHAT_ID,
             question="Сегодня играем в WZ?",
-            options=["Да", "Нет"],
+	    options=["19:30", "20:00", "Нет"],
             is_anonymous=False,
             allows_multiple_answers=False,
         )
@@ -82,7 +82,7 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         await update.message.reply_poll(
             question="Сегодня играем в WZ?",
-            options=["Да", "Нет"],
+            options=["19:30", "20:00", "Нет"],
             is_anonymous=False,
             allows_multiple_answers=False,
         )
