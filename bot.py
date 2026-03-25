@@ -1,10 +1,12 @@
 import os
 import logging
 import threading
+import time
 from datetime import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pytz import timezone
 
+import requests
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -23,15 +25,40 @@ def run_http_server():
     server = HTTPServer(('0.0.0.0', 10000), SimpleHandler)
     server.serve_forever()
 
-# Запускаем HTTP-сервер в отдельном потоке (daemon=True значит,
-# что он автоматически завершится при остановке бота)
+# Запускаем HTTP-сервер в отдельном потоке
 threading.Thread(target=run_http_server, daemon=True).start()
 # ====================================================
 
+# ========== KEEP-ALIVE ПИНГИ ДЛЯ ПРЕДОТВРАЩЕНИЯ ЗАСЫПАНИЯ ==========
+def keep_alive():
+    """Пингует Render и Telegram каждые 5 минут, чтобы бот не засыпал"""
+    while True:
+        time.sleep(300)  # 5 минут
+        try:
+            # Пингуем Render URL (чтобы Render видел активность)
+            render_url = os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com")
+            requests.get(render_url, timeout=10)
+            logging.debug("Keep-alive: pinged Render URL")
+        except Exception as e:
+            logging.debug(f"Keep-alive Render ping failed: {e}")
+        
+        try:
+            # Пингуем Telegram API (прямая проверка бота)
+            token = os.environ.get("BOT_TOKEN")
+            if token:
+                requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
+                logging.debug("Keep-alive: pinged Telegram API")
+        except Exception as e:
+            logging.debug(f"Keep-alive Telegram ping failed: {e}")
+
+# Запускаем keep-alive в отдельном потоке
+threading.Thread(target=keep_alive, daemon=True).start()
+# ====================================================
+
 # ========== НАСТРОЙКИ ИЗ ПЕРЕМЕННЫХ ОКРУЖЕНИЯ ==========
-TOKEN = os.environ.get("BOT_TOKEN")  # Токен из переменных окружения
-CHAT_ID = int(os.environ.get("CHAT_ID", 0))  # ID группы (преобразуем в число)
-ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "12:00")  # По умолчанию 12:00
+TOKEN = os.environ.get("BOT_TOKEN")
+CHAT_ID = int(os.environ.get("CHAT_ID", 0))
+ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "12:00")
 # ======================================================
 
 # Преобразуем строку "12:00" в time(hour=12, minute=0)
@@ -39,7 +66,6 @@ try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
     ВРЕМЯ_ОТПРАВКИ = time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
 except:
-    # Если ошибка в формате, ставим 12:00
     ВРЕМЯ_ОТПРАВКИ = time(hour=12, minute=0, tzinfo=timezone('Europe/Moscow'))
     logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 12:00")
 
@@ -62,7 +88,7 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_poll(
             chat_id=CHAT_ID,
             question="Сегодня играем в WZ?",
-	    options=["✅ 19:30", "✅ 20:00", "❌ Нет"],
+            options=["✅ 19:30", "✅ 20:00", "❌ Нет"],
             is_anonymous=False,
             allows_multiple_answers=True,
         )
@@ -74,7 +100,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик команды /start"""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
-        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос 'Сегодня играем в WZ?'"
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос 'Сегодня играем в WZ?'\n"
+        f"Варианты: ✅ 19:30, ✅ 20:00, ❌ Нет"
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -91,6 +118,7 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
+    logger.info("🔋 Keep-alive поток запущен (пинг каждые 10 минут)")
     
     # Создаём приложение
     application = Application.builder().token(TOKEN).build()
@@ -104,10 +132,10 @@ if __name__ == "__main__":
     job_queue.run_daily(
         send_daily_poll, 
         time=ВРЕМЯ_ОТПРАВКИ, 
-        days=tuple(range(7))  # Все дни недели
+        days=tuple(range(7))
     )
     
     logger.info("🚀 Бот запущен и готов к работе! HTTP-сервер слушает порт 10000")
     
-    # Запускаем бота (polling mode)
+    # Запускаем бота
     application.run_polling()
