@@ -1,8 +1,8 @@
 import os
 import logging
 import threading
-import time
-from datetime import time
+import time  # ← это для time.sleep()
+import datetime  # ← это для datetime.time()
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pytz import timezone
 
@@ -64,9 +64,9 @@ CHAT_ID = int(os.environ.get("CHAT_ID", 0))
 # Преобразуем строку "12:00" в time(hour=12, minute=0)
 try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
-    ВРЕМЯ_ОТПРАВКИ = time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
+    ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
 except:
-    ВРЕМЯ_ОТПРАВКИ = time(hour=12, minute=0, tzinfo=timezone('Europe/Moscow'))
+    ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=12, minute=0, tzinfo=timezone('Europe/Moscow'))
     logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 12:00")
 
 # Проверка, что переменные загружены
