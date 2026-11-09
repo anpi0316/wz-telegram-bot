@@ -3,6 +3,7 @@ import logging
 import threading
 import time
 import datetime
+import json
 import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from pytz import timezone
@@ -33,7 +34,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ========== HTTP-СЕРВЕР ДЛЯ RENDER ==========
+# ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD для UptimeRobot) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -55,16 +56,22 @@ threading.Thread(target=run_http_server, daemon=True).start()
 
 # ========== KEEP-ALIVE ==========
 def keep_alive():
+    """Пингует Render и Telegram каждые 15 минут, чтобы сервис не засыпал."""
     while True:
         time.sleep(900)
         try:
-            httpx.get(os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"), timeout=10)
-        except: pass
+            httpx.get(
+                os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"),
+                timeout=10,
+            )
+        except Exception:
+            pass
         try:
             token = os.environ.get("BOT_TOKEN")
             if token:
                 httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-        except: pass
+        except Exception:
+            pass
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
@@ -72,7 +79,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 def parse_warzone_posts_fresh(limit: int = 5):
     """
     Парсит страницу блога Warzone и возвращает ТОЛЬКО посты,
-    опубликованные за последние 24 часа (по дате на странице).
+    опубликованные за последние 24 часа.
     """
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=HEADERS, timeout=25, follow_redirects=True)
@@ -101,11 +108,11 @@ def parse_warzone_posts_fresh(limit: int = 5):
                 continue
 
             try:
-                # Парсим дату вида "November 05, 2026"
-                post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
+                post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(
+                    tzinfo=datetime.timezone.utc
+                )
                 age = now - post_date
                 if age.total_seconds() > 24 * 3600:
-                    # Пост старше 24 часов — пропускаем
                     continue
             except Exception as e:
                 logging.warning(f"Не удалось распарсить дату '{date_str}': {e}")
@@ -129,42 +136,77 @@ def parse_warzone_posts_fresh(limit: int = 5):
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
         return []
 
-# ========== ПАРСИНГ МЕТЫ ==========
+# ========== ПАРСИНГ МЕТЫ (JSON из HTML) ==========
 def parse_meta():
     """
-    Парсит warzoneloadout.games и извлекает топ-оружие из S-тира.
-    Возвращает строку вида: "Cronen Osprey (Long Range), VEL 46 (Close Range)"
+    Парсит warzoneloadout.games и извлекает топ-3 оружия.
+    Данные встроены в HTML в виде JSON внутри <script>.
     """
     try:
         response = httpx.get(META_URL, headers=HEADERS, timeout=25, follow_redirects=True)
         response.raise_for_status()
-        soup = BeautifulSoup(response.text, "html.parser")
+        html = response.text
 
-        # Ищем заголовки оружия в S-тире. По HTML структуре это <h2> внутри блоков
-        # с классом, содержащим "Absolute Meta" или "S Tier".
-        # Универсальный подход: ищем все <h2>, в тексте которых есть "#1"
+        # Проверяем, что данные есть
+        if '"metaSlug":"warzone-meta"' not in html and '"metaSlug": "warzone-meta"' not in html:
+            logging.warning("Мета: маркер 'metaSlug: warzone-meta' не найден в HTML")
+            return None
+
+        # Ищем массив "entries": [...]
+        start_match = re.search(r'"entries"\s*:\s*\[', html)
+        if not start_match:
+            logging.warning("Мета: массив 'entries' не найден")
+            return None
+
+        # Находим сбалансированные скобки для массива
+        start = start_match.end() - 1  # позиция '['
+        depth = 0
+        end = None
+        in_string = False
+        escape = False
+        for i in range(start, len(html)):
+            ch = html[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == '\\':
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == '[':
+                depth += 1
+            elif ch == ']':
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+
+        if not end:
+            logging.warning("Мета: не удалось найти конец массива 'entries'")
+            return None
+
+        entries_json = html[start:end]
+        entries = json.loads(entries_json)
+
+        # Берём первые 3 записи (они уже отсортированы по rank)
         meta_items = []
-        for h2 in soup.find_all("h2"):
-            text = h2.get_text(" ", strip=True)
-            # Пример: "Cronen Osprey#1 Long RangeAssault Riflemw4"
-            # Или: "VEL 46#1 Close RangeSMGModern Warfare 2"
-            if "#1" in text and ("Long Range" in text or "Close Range" in text or "Sniper" in text):
-                # Вытаскиваем имя оружия (до #1) и категорию (Long Range / Close Range / Sniper)
-                name_match = re.match(r"^([^#]+)#1\s*(Long Range|Close Range|Sniper)", text)
-                if name_match:
-                    weapon_name = name_match.group(1).strip()
-                    category = name_match.group(2)
-                    meta_items.append(f"{weapon_name} ({category})")
+        for entry in entries[:3]:
+            name = entry.get("weaponName", "").strip()
+            playstyle = entry.get("playstyle", "").strip()
+            if name:
+                meta_items.append(f"{name} ({playstyle})" if playstyle else name)
 
         if meta_items:
-            # Берём первые 3 (Long Range, Close Range, Sniper)
-            unique = list(dict.fromkeys(meta_items))[:3]
-            result = ", ".join(unique)
+            result = ", ".join(meta_items)
             logging.info(f"Мета спарсена: {result}")
             return result
         else:
-            logging.warning("Мета не найдена на странице")
+            logging.warning("Мета: entries пустые")
             return None
+
     except Exception as e:
         logging.warning(f"Ошибка парсинга меты: {e}")
         return None
@@ -205,15 +247,24 @@ async def get_llm_summary(posts):
         response = openrouter_client.chat.completions.create(
             model="openrouter/free",
             messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет»."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет».",
+                },
+                {"role": "user", "content": prompt},
             ],
-            timeout=40
+            timeout=40,
         )
         answer = response.choices[0].message.content.strip()
+        # Чистим возможные английские вступления, ссылки и шаблон «Обновление: есть/нет»
         answer = re.sub(r"^(Sure|Of course|Here.*?:)\s*", "", answer, flags=re.IGNORECASE)
         answer = re.sub(r"https?://\S+", "", answer).strip()
-        answer = re.sub(r"🔧?\s*Обновление\s*:\s*(есть|нет)\s*[—\-–]?\s*", "", answer, flags=re.IGNORECASE).strip()
+        answer = re.sub(
+            r"🔧?\s*Обновление\s*:\s*(есть|нет)\s*[—\-–]?\s*",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        ).strip()
         return answer
     except Exception as e:
         logging.error(f"Ошибка OpenRouter: {e}")
@@ -227,14 +278,24 @@ CHAT_ID = int(os.environ.get("CHAT_ID", 0))
 try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
-except:
+except Exception:
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=20, minute=0, tzinfo=timezone('Europe/Moscow'))
+    logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 20:00")
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не задан! Добавьте его в переменные окружения.")
+if not CHAT_ID:
+    raise ValueError("❌ CHAT_ID не задан! Добавьте его в переменные окружения.")
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА ОПРОСА ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет опрос каждый день с метой и новостями Warzone (если есть за сутки)."""
     try:
         posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
@@ -260,12 +321,14 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start."""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
         f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone (если есть за сутки)."
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск опроса командой /poll."""
     try:
         posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
@@ -292,6 +355,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
 
     application = Application.builder().token(TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("poll", poll_now))
 
