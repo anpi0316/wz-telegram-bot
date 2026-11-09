@@ -318,24 +318,56 @@ async def get_llm_summary(posts):
 
 # ========== КОМАНДА /ask ==========
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет вопрос в LLM с контекстом «эксперт по Warzone» и текущей датой."""
+    """Отправляет вопрос в LLM, подмешивая свежие новости и сборки из кэша."""
     question = " ".join(context.args).strip() if context.args else ""
 
     if not question:
         await update.message.reply_text(
             "🤔 Напишите вопрос после команды, например:\n"
             "<code>/ask какая сейчас мета?</code>\n"
-            "<code>/ask когда было последнее обновление?</code>",
+            "<code>/ask подбери сборку для Signal 50</code>",
             parse_mode="HTML",
         )
         return
 
     loading_msg = await update.message.reply_text("⏳ Думаю над ответом…")
 
-    # Текущая дата в Москве
-    now_msk = datetime.datetime.now(timezone('Europe/Moscow'))
-    today_str = now_msk.strftime("%d %B %Y")  # например "09 November 2026"
+    # 1. Свежие новости из блога
+    posts = parse_warzone_posts_fresh(limit=5)
+    news_context = ""
+    if posts:
+        news_lines = [f"— {p['title']} ({p['date']})" for p in posts]
+        news_context = "\n".join(news_lines)
+    else:
+        last_date = load_last_news_date()
+        if last_date:
+            news_context = f"Свежих новостей нет. Последняя была: {last_date}."
 
+    # 2. Ищем сборку, если вопрос про оружие
+    weapon_context = ""
+    question_lower = question.lower()
+    for weapon_name in WEAPON_BUILDS.keys():
+        if weapon_name.lower() in question_lower:
+            build = WEAPON_BUILDS[weapon_name]
+            att_lines = []
+            if isinstance(build, dict):
+                for att in build.get("attachments", []):
+                    if isinstance(att, dict):
+                        att_lines.append(f"  • {att.get('slot', '')}: {att.get('name', '')}")
+                share = build.get("shareCode", "")
+            else:
+                share = ""
+            if att_lines:
+                weapon_context = f"\nАктуальная сборка для {weapon_name} (из MetaRadar):\n" + "\n".join(att_lines)
+                if share:
+                    weapon_context += f"\n  Share code: {share}"
+            break
+
+    # 3. Текущая дата
+    now_msk = datetime.datetime.now(timezone('Europe/Moscow'))
+    today_str = now_msk.strftime("%d %B %Y")
+
+    # 4. Формируем промпт
     prompt = (
         f"Сегодня {today_str} (МСК).\n"
         "Ты — опытный эксперт по Call of Duty: Warzone. "
@@ -345,16 +377,22 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "— Без ссылок, URL, доменов.\n"
         "— Не пиши вступления вроде «Конечно» или «Вот».\n"
         "— Максимум 5–6 предложений.\n"
-        "— Если вопрос про обновления или даты — используй сегодняшнюю дату как точку отсчёта. "
-        "Если не знаешь точной даты последнего обновления — скажи «Не уверен в точной дате, но...» и дай общий ответ.\n\n"
-        f"Вопрос игрока: {question}"
+        "— Если в контексте есть факты (новости или сборка) — используй их. "
+        "Не выдумывай то, чего нет в контексте.\n\n"
     )
+
+    if news_context:
+        prompt += f"СВЕЖИЕ НОВОСТИ WARZONE (из блога):\n{news_context}\n\n"
+    if weapon_context:
+        prompt += f"ДАННЫЕ ПО ОРУЖИЮ:\n{weapon_context}\n\n"
+
+    prompt += f"Вопрос игрока: {question}"
 
     try:
         response = openrouter_client.chat.completions.create(
-            model="nvidia/nemotron-3.5-super-vl:free",
+            model="openrouter/free",
             messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок."},
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. Используй только факты из контекста."},
                 {"role": "user", "content": prompt},
             ],
             timeout=HTTP_TIMEOUT,
@@ -420,7 +458,7 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             response = openrouter_client.chat.completions.create(
-                model="nvidia/nemotron-3.5-super-vl:free",
+                model="openrouter/free",
                 messages=[
                     {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без имён."},
                     {"role": "user", "content": prompt},
