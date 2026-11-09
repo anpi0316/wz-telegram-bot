@@ -48,6 +48,9 @@ BLOG_HEADERS = {
 
 LAST_NEWS_FILE = "last_news.json"
 
+# Глобальный кэш сборок из MetaRadar (заполняется при парсинге меты)
+WEAPON_BUILDS = {}
+
 # ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -165,12 +168,13 @@ def parse_warzone_posts_fresh(limit: int = 5):
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
         return []
 
-# ========== ПАРСИНГ МЕТЫ ==========
+# ========== ПАРСИНГ МЕТЫ (MetaRadar API) ==========
 def parse_meta_raw():
     """
-    Возвращает словарь {категория: [список имён]}.
-    Используется и для текста, и для кнопок.
+    Возвращает словарь {категория: [топ-3 оружия]} и заполняет WEAPON_BUILDS.
+    Согласно документации MetaRadar, поле build содержит рекомендованную сборку [citation:1].
     """
+    global WEAPON_BUILDS
     try:
         response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
@@ -182,11 +186,19 @@ def parse_meta_raw():
             return None
 
         groups = {"Long range": [], "Close range": [], "Sniper": []}
+        WEAPON_BUILDS = {}  # сбрасываем кэш
+
         for w in weapons:
             role = (w.get("role") or "").lower()
             name = w.get("name", "").strip()
             if not name:
                 continue
+
+            # Сохраняем сборку из API (поле build)
+            build = w.get("build")
+            if build:
+                WEAPON_BUILDS[name] = build
+
             if "long range" in role:
                 groups["Long range"].append(name)
             elif "close range" in role:
@@ -228,49 +240,38 @@ def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
             continue
         row = []
         for name in items:
-            # callback_data ограничен 64 байтами — названия оружия влезают
+            # callback_data ограничен 64 байтами, названия оружия влезают [citation:2][citation:7]
             row.append(InlineKeyboardButton(name, callback_data=f"build|{name}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows)
 
-# ========== LLM ДЛЯ СБОРКИ ОРУЖИЯ ==========
+# ========== СБОРКА ИЗ METARADAR (БЕЗ LLM) ==========
 async def get_weapon_build(weapon_name: str) -> str:
     """
-    Спрашивает LLM об актуальной сборке для оружия.
-    Ответ на русском, без ссылок, кратко.
+    Возвращает сборку из MetaRadar API (уже сохранённую в WEAPON_BUILDS).
+    Если сборки нет — пишет «Нет данных».
     """
-    prompt = (
-        f"Ты — эксперт по Call of Duty: Warzone. Дай актуальную мета-сборку для оружия «{weapon_name}».\n\n"
-        "ФОРМАТ ОТВЕТА (строго):\n"
-        "🔫 <b>{weapon_name}</b>\n"
-        "• Дуло: ...\n"
-        "• Ствол: ...\n"
-        "• Прицел: ...\n"
-        "• Магазин: ...\n"
-        "• Рукоятка/приклад: ...\n\n"
-        "ПРАВИЛА:\n"
-        "— Отвечай ТОЛЬКО на русском языке.\n"
-        "— НЕ добавляй ссылки, URL.\n"
-        "— Не пиши вступления.\n"
-        "— Максимум 6 строк.\n"
-        "— Если не знаешь актуальную сборку — напиши «Нет данных по этой сборке».\n"
-    )
+    build = WEAPON_BUILDS.get(weapon_name)
+    if not build:
+        return f"🔫 <b>{weapon_name}</b>\n\nНет данных по этой сборке."
 
-    try:
-        response = openrouter_client.chat.completions.create(
-            model="openrouter/free",
-            messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок."},
-                {"role": "user", "content": prompt},
-            ],
-            timeout=HTTP_TIMEOUT,
-        )
-        answer = response.choices[0].message.content.strip()
-        answer = re.sub(r"https?://\S+", "", answer).strip()
-        return answer
-    except Exception as e:
-        logging.error(f"Ошибка LLM (сборка): {e}")
-        return f"⚠️ Не удалось получить сборку для «{weapon_name}». Попробуйте позже."
+    lines = [f"🔫 <b>{weapon_name}</b>\n"]
+    # build может быть списком словарей с полями slot/name (согласно документации) [citation:1]
+    if isinstance(build, list):
+        for item in build:
+            if isinstance(item, dict):
+                slot = item.get("slot", "")
+                name = item.get("name", "")
+                if name:
+                    lines.append(f"• {slot}: {name}")
+    elif isinstance(build, dict):
+        for slot, attachment in build.items():
+            if attachment:
+                lines.append(f"• {slot}: {attachment}")
+    else:
+        return f"🔫 <b>{weapon_name}</b>\n\nСборка есть, но формат не распознан."
+
+    return "\n".join(lines)
 
 # ========== LLM ДЛЯ НОВОСТЕЙ ==========
 async def get_llm_summary(posts):
@@ -336,12 +337,6 @@ logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА МЕТЫ + НОВОСТЕЙ ==========
 async def send_meta_and_news(context_or_update, is_command: bool = False):
-    """
-    Отправляет два сообщения:
-    1. Мета с кнопками (HTML, жирные названия).
-    2. Новости (обычное сообщение).
-    Плюс опрос отдельно.
-    """
     posts = parse_warzone_posts_fresh(limit=5)
     summary = await get_llm_summary(posts)
     groups = parse_meta_raw()
@@ -381,7 +376,7 @@ async def send_meta_and_news(context_or_update, is_command: bool = False):
 
     await bot.send_message(chat_id=chat_id, text=news_text)
 
-    # 3. Опрос
+    # 3. Опрос (вопрос ограничен 300 символами для ботов) [citation:4][citation:9]
     await bot.send_poll(
         chat_id=chat_id,
         question="Сегодня играем в WZ?",
@@ -414,14 +409,13 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def on_weapon_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик нажатия на кнопку с оружием."""
     query = update.callback_query
-    await query.answer()  # убираем "часики" на кнопке
+    await query.answer()
 
     data = query.data or ""
     if not data.startswith("build|"):
         return
     weapon_name = data.split("|", 1)[1]
 
-    # Отдельным сообщением отправляем "загрузка..."
     loading_msg = await query.message.reply_text(
         f"⏳ Ищу актуальную сборку для <b>{weapon_name}</b>...",
         parse_mode="HTML",
@@ -429,12 +423,10 @@ async def on_weapon_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     build = await get_weapon_build(weapon_name)
 
-    # Отправляем ответ отдельным сообщением
     await query.message.reply_text(
-        f"<b>{weapon_name}</b>\n\n{build}",
+        build,
         parse_mode="HTML",
     )
-    # Удаляем "загрузку"
     try:
         await loading_msg.delete()
     except Exception:
