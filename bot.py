@@ -249,27 +249,46 @@ def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
 async def get_weapon_build(weapon_name: str) -> str:
     """
     Возвращает сборку из MetaRadar API (уже сохранённую в WEAPON_BUILDS).
-    Если сборки нет — пишет «Нет данных».
+    build = {
+        "label": "Long range",
+        "attachments": [{"slot": "Optic", "name": "Cronen R808"}, ...],
+        "shareCode": "A03-3KB4J-BPH2Q-FL11",
+        "updatedAt": "..."
+    }
     """
     build = WEAPON_BUILDS.get(weapon_name)
     if not build:
         return f"🔫 <b>{weapon_name}</b>\n\nНет данных по этой сборке."
 
-    lines = [f"🔫 <b>{weapon_name}</b>\n"]
-    # build может быть списком словарей с полями slot/name (согласно документации) [citation:1]
-    if isinstance(build, list):
-        for item in build:
-            if isinstance(item, dict):
-                slot = item.get("slot", "")
-                name = item.get("name", "")
+    lines = [f"🔫 <b>{weapon_name}</b>"]
+
+    # Роль (Long range / Close range / Sniper)
+    label = build.get("label", "")
+    if label:
+        lines.append(f"🎯 {label}")
+
+    lines.append("")  # пустая строка
+
+    # Аттачменты — каждый с новой строки
+    attachments = build.get("attachments", [])
+    if isinstance(attachments, list):
+        for att in attachments:
+            if isinstance(att, dict):
+                slot = att.get("slot", "").strip()
+                name = att.get("name", "").strip()
                 if name:
-                    lines.append(f"• {slot}: {name}")
-    elif isinstance(build, dict):
-        for slot, attachment in build.items():
-            if attachment:
-                lines.append(f"• {slot}: {attachment}")
-    else:
-        return f"🔫 <b>{weapon_name}</b>\n\nСборка есть, но формат не распознан."
+                    lines.append(f"• <b>{slot}</b>: {name}")
+    elif isinstance(attachments, dict):
+        # на случай, если API вернёт словарь вместо списка
+        for slot, name in attachments.items():
+            if name:
+                lines.append(f"• <b>{slot}</b>: {name}")
+
+    # Код шаринга
+    share_code = build.get("shareCode", "")
+    if share_code:
+        lines.append("")
+        lines.append(f"📋 Share code: <code>{share_code}</code>")
 
     return "\n".join(lines)
 
