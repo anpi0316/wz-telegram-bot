@@ -125,7 +125,7 @@ def get_latest_post_date():
         logging.warning(f"Не удалось получить дату последнего поста: {e}")
     return None
 
-# ========== ПАРСИНГ БЛОГА ==========
+# ========== ПАРСИНГ БЛОГА (за 24 часа) ==========
 def parse_warzone_posts_fresh(limit: int = 5):
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
@@ -169,6 +169,40 @@ def parse_warzone_posts_fresh(limit: int = 5):
         return fresh_posts
     except Exception as e:
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
+        return []
+
+# ========== ПАРСИНГ БЛОГА (последние, без фильтра по 24ч) ==========
+def parse_warzone_posts_latest(limit: int = 5):
+    """Возвращает последние посты с блога, без фильтра по 24 часам."""
+    try:
+        response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        cards = soup.select("div.blog-card-item")
+        posts = []
+
+        for card in cards:
+            title_tag = card.select_one(".title a")
+            if not title_tag:
+                continue
+            title = title_tag.get_text(strip=True)
+            href = title_tag.get("href", "").strip()
+            url = "https://www.callofduty.com" + href if href.startswith("/") else href
+
+            date_div = card.select_one(".news-published")
+            date_str = date_div.get("data-date", "") if date_div else ""
+
+            sub = card.select_one(".subtitle")
+            summary = sub.get_text(strip=True) if sub else ""
+
+            posts.append({"title": title, "date": date_str, "summary": summary, "url": url})
+            if len(posts) >= limit:
+                break
+
+        logging.info(f"Последних постов (без фильтра): {len(posts)}")
+        return posts
+    except Exception as e:
+        logging.warning(f"Ошибка парсинга последних постов: {e}")
         return []
 
 # ========== ПАРСИНГ МЕТЫ (MetaRadar API) ==========
@@ -318,7 +352,7 @@ async def get_llm_summary(posts):
 
 # ========== КОМАНДА /ask ==========
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет вопрос в LLM, подмешивая свежие новости и сборки из кэша."""
+    """Отправляет вопрос в LLM, подмешивая последние посты блога (без фильтра 24ч) и сборки."""
     question = " ".join(context.args).strip() if context.args else ""
 
     if not question:
@@ -332,11 +366,11 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading_msg = await update.message.reply_text("⏳ Думаю над ответом…")
 
-    # 1. Свежие новости из блога
-    posts = parse_warzone_posts_fresh(limit=5)
+    # 1. Последние посты из блога (без фильтра по 24ч)
+    posts = parse_warzone_posts_latest(limit=5)
     news_context = ""
     if posts:
-        news_lines = [f"— {p['title']} ({p['date']})" for p in posts]
+        news_lines = [f"— {p['title']} ({p['date']})" for p in posts if p.get("title")]
         news_context = "\n".join(news_lines)
     else:
         last_date = load_last_news_date()
@@ -382,7 +416,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if news_context:
-        prompt += f"СВЕЖИЕ НОВОСТИ WARZONE (из блога):\n{news_context}\n\n"
+        prompt += f"ПОСЛЕДНИЕ НОВОСТИ WARZONE (из официального блога):\n{news_context}\n\n"
     if weapon_context:
         prompt += f"ДАННЫЕ ПО ОРУЖИЮ:\n{weapon_context}\n\n"
 
