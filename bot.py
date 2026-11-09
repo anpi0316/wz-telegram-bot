@@ -27,10 +27,22 @@ openrouter_client = OpenAI(
 WARZONE_BLOG_URL = "https://www.callofduty.com/blog/warzone"
 METARADAR_API_URL = "https://metaradar.gg/api/v1/meta/warzone"
 
+# Таймаут для всех HTTP-запросов (80 секунд)
+HTTP_TIMEOUT = 80
+
 HEADERS = {
     "User-Agent": "WZ-Poll-Bot/1.0 (https://github.com/anpi0316/wz-telegram-bot)",
     "Accept": "application/json",
 }
+
+BLOG_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                  "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+}
+
+LAST_NEWS_FILE = "last_news.json"
 
 # ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD для UptimeRobot) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -54,10 +66,14 @@ threading.Thread(target=run_http_server, daemon=True).start()
 
 # ========== KEEP-ALIVE ==========
 def keep_alive():
+    """Пингует Render и Telegram каждые 15 минут, чтобы сервис не засыпал."""
     while True:
         time.sleep(900)
         try:
-            httpx.get(os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"), timeout=10)
+            httpx.get(
+                os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"),
+                timeout=10,
+            )
         except Exception:
             pass
         try:
@@ -69,14 +85,40 @@ def keep_alive():
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
+# ========== ФАЙЛ ДЛЯ ДАТЫ ПОСЛЕДНЕЙ НОВОСТИ ==========
+def save_last_news_date(date_str: str):
+    """Сохраняет дату последней найденной новости."""
+    try:
+        with open(LAST_NEWS_FILE, "w", encoding="utf-8") as f:
+            json.dump({"last_date": date_str}, f, ensure_ascii=False)
+    except Exception as e:
+        logging.warning(f"Не удалось сохранить дату новости: {e}")
+
+def load_last_news_date():
+    """Загружает дату последней найденной новости."""
+    try:
+        if os.path.exists(LAST_NEWS_FILE):
+            with open(LAST_NEWS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data.get("last_date")
+    except Exception as e:
+        logging.warning(f"Не удалось загрузить дату новости: {e}")
+    return None
+
 # ========== ПАРСИНГ БЛОГА (только за последние 24 часа) ==========
 def parse_warzone_posts_fresh(limit: int = 5):
+    """
+    Парсит страницу блога Warzone и возвращает ТОЛЬКО посты,
+    опубликованные за последние 24 часа.
+    """
     try:
-        response = httpx.get(WARZONE_BLOG_URL, headers=HEADERS, timeout=25, follow_redirects=True)
+        response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
         cards = soup.select("div.blog-card-item")
+        logging.info(f"Warzone blog: найдено карточек {len(cards)}")
+
         now = datetime.datetime.now(datetime.timezone.utc)
         fresh_posts = []
 
@@ -99,7 +141,8 @@ def parse_warzone_posts_fresh(limit: int = 5):
                 post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
                 if (now - post_date).total_seconds() > 24 * 3600:
                     continue
-            except Exception:
+            except Exception as e:
+                logging.warning(f"Не удалось распарсить дату '{date_str}': {e}")
                 continue
 
             sub = card.select_one(".subtitle")
@@ -119,10 +162,13 @@ def parse_warzone_posts_fresh(limit: int = 5):
 def parse_meta():
     """
     Получает мету через официальный API MetaRadar.
-    Возвращает строку: "Long Range: A, B, C | Close Range: D, E, F | Sniper: G, H, I"
+    Возвращает многострочную строку:
+      🎯 Long Range: A, B, C
+      🔫 Close Range: D, E, F
+      🎯 Sniper: G, H, I
     """
     try:
-        response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=25, follow_redirects=True)
+        response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         data = response.json()
 
@@ -131,8 +177,6 @@ def parse_meta():
             logging.warning("MetaRadar: пустой список оружия")
             return None
 
-        # Группируем по роли. В API поле role выглядит как "#1 Long range", "#2 Close range" и т.д.
-        # Нам нужны категории: Long range, Close range, Sniper
         groups = {"Long range": [], "Close range": [], "Sniper": []}
 
         for w in weapons:
@@ -140,8 +184,6 @@ def parse_meta():
             name = w.get("name", "").strip()
             if not name:
                 continue
-
-            # Определяем категорию по ключевым словам в role
             if "long range" in role.lower():
                 groups["Long range"].append(name)
             elif "close range" in role.lower():
@@ -149,16 +191,20 @@ def parse_meta():
             elif "sniper" in role.lower():
                 groups["Sniper"].append(name)
 
-        # Формируем строку только для непустых групп
-        parts = []
-        for label, items in groups.items():
+        lines = []
+        labels = {
+            "Long range": "🎯 Long Range",
+            "Close range": "🔫 Close Range",
+            "Sniper": "🎯 Sniper",
+        }
+        for key, items in groups.items():
             if items:
                 top3 = ", ".join(items[:3])
-                parts.append(f"{label}: {top3}")
+                lines.append(f"{labels[key]}: {top3}")
 
-        if parts:
-            result = " | ".join(parts)
-            logging.info(f"Мета спарсена (MetaRadar): {result}")
+        if lines:
+            result = "\n".join(lines)
+            logging.info(f"Мета спарсена (MetaRadar):\n{result}")
             return result
         else:
             logging.warning("MetaRadar: не удалось сгруппировать оружие по ролям")
@@ -199,7 +245,7 @@ async def get_llm_summary(posts):
                 {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет»."},
                 {"role": "user", "content": prompt},
             ],
-            timeout=40,
+            timeout=HTTP_TIMEOUT,
         )
         answer = response.choices[0].message.content.strip()
         answer = re.sub(r"^(Sure|Of course|Here.*?:)\s*", "", answer, flags=re.IGNORECASE)
@@ -232,6 +278,7 @@ logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА ОПРОСА ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет опрос каждый день с метой и новостями Warzone."""
     try:
         posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
@@ -239,9 +286,19 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
 
         lines = ["Сегодня играем в WZ?"]
         if meta:
-            lines.append(f"🎯 Мета: {meta}")
-        if summary:
-            lines.append(f"📰 {summary}")
+            lines.append(meta)
+
+        if summary and posts:
+            latest_date = posts[0].get("date", "")
+            if latest_date:
+                save_last_news_date(latest_date)
+            lines.append(f"📰 News: {summary}")
+        else:
+            last_date = load_last_news_date()
+            if last_date:
+                lines.append(f"📰 News: Nothing New (последняя: {last_date})")
+            else:
+                lines.append("📰 News: Nothing New")
 
         question_text = "\n\n".join(lines)
 
@@ -257,12 +314,14 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start."""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
         f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone."
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск опроса командой /poll."""
     try:
         posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
@@ -270,9 +329,19 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         lines = ["Сегодня играем в WZ?"]
         if meta:
-            lines.append(f"🎯 Мета: {meta}")
-        if summary:
-            lines.append(f"📰 {summary}")
+            lines.append(meta)
+
+        if summary and posts:
+            latest_date = posts[0].get("date", "")
+            if latest_date:
+                save_last_news_date(latest_date)
+            lines.append(f"📰 News: {summary}")
+        else:
+            last_date = load_last_news_date()
+            if last_date:
+                lines.append(f"📰 News: Nothing New (последняя: {last_date})")
+            else:
+                lines.append("📰 News: Nothing New")
 
         question_text = "\n\n".join(lines)
 
