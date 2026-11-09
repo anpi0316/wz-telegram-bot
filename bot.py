@@ -390,7 +390,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = openrouter_client.chat.completions.create(
-            model="openrouter/free",
+            model="nvidia/nemotron-3.5-super-vl:free",
             messages=[
                 {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. Используй только факты из контекста."},
                 {"role": "user", "content": prompt},
