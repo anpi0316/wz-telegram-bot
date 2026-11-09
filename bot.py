@@ -410,8 +410,8 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "— Только русский язык.\n"
         "— Без ссылок, URL, доменов.\n"
         "— Не пиши вступления вроде «Конечно» или «Вот».\n"
-        "— Максимум 5–6 предложений.\n"
-        "— Если в контексте есть факты (новости или сборка) — используй их. "
+        "— Максимум 4–5 предложений.\n"
+        "— Если контекст не содержит ответа на вопрос — ответь из своих общих знаний о Warzone.\n\n"
         "Не выдумывай то, чего нет в контексте.\n\n"
     )
 
@@ -426,7 +426,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         response = openrouter_client.chat.completions.create(
             model="nvidia/nemotron-3.5-super-vl:free",
             messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. Используй только факты из контекста."},
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. "
+"Используй факты из контекста, если они есть. Если в контексте нет ответа — "
+"ответь из своих знаний, но не выдумывай даты и события, которых не знаешь."},
                 {"role": "user", "content": prompt},
             ],
             timeout=HTTP_TIMEOUT,
