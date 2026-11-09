@@ -352,7 +352,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     try:
         response = openrouter_client.chat.completions.create(
-            model="meta-llama/llama-3.3-70b-instruct:free",
+            model="deepseek/deepseek-r1:free",
             messages=[
                 {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок."},
                 {"role": "user", "content": prompt},
@@ -420,7 +420,7 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
 
         try:
             response = openrouter_client.chat.completions.create(
-                model="meta-llama/llama-3.3-70b-instruct:free",
+                model="deepseek/deepseek-r1:free",
                 messages=[
                     {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без имён."},
                     {"role": "user", "content": prompt},
