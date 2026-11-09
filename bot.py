@@ -278,33 +278,40 @@ logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА ОПРОСА ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет опрос каждый день с метой и новостями Warzone."""
+    """Отправляет мету/новости отдельным сообщением, затем короткий опрос."""
     try:
         posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
         meta = parse_meta()
 
-        lines = ["Сегодня играем в WZ?"]
+        # 1. Собираем блок с метой и новостями
+        info_lines = []
         if meta:
-            lines.append(meta)
+            info_lines.append(meta)
 
         if summary and posts:
             latest_date = posts[0].get("date", "")
             if latest_date:
                 save_last_news_date(latest_date)
-            lines.append(f"📰 News: {summary}")
+            info_lines.append(f"📰 News: {summary}")
         else:
             last_date = load_last_news_date()
             if last_date:
-                lines.append(f"📰 News: Nothing New (последняя: {last_date})")
+                info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
             else:
-                lines.append("📰 News: Nothing New")
+                info_lines.append("📰 News: Nothing New")
 
-        question_text = "\n\n".join(lines)
+        # 2. Отправляем обычным сообщением (переносы строк работают)
+        if info_lines:
+            await context.bot.send_message(
+                chat_id=CHAT_ID,
+                text="\n\n".join(info_lines),
+            )
 
+        # 3. Отправляем короткий опрос
         await context.bot.send_poll(
             chat_id=CHAT_ID,
-            question=question_text[:300],
+            question="Сегодня играем в WZ?",
             options=["✅ 20:00", "❌ Нет"],
             is_anonymous=False,
             allows_multiple_answers=False,
@@ -327,26 +334,27 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
         summary = await get_llm_summary(posts)
         meta = parse_meta()
 
-        lines = ["Сегодня играем в WZ?"]
+        info_lines = []
         if meta:
-            lines.append(meta)
+            info_lines.append(meta)
 
         if summary and posts:
             latest_date = posts[0].get("date", "")
             if latest_date:
                 save_last_news_date(latest_date)
-            lines.append(f"📰 News: {summary}")
+            info_lines.append(f"📰 News: {summary}")
         else:
             last_date = load_last_news_date()
             if last_date:
-                lines.append(f"📰 News: Nothing New (последняя: {last_date})")
+                info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
             else:
-                lines.append("📰 News: Nothing New")
+                info_lines.append("📰 News: Nothing New")
 
-        question_text = "\n\n".join(lines)
+        if info_lines:
+            await update.message.reply_text("\n\n".join(info_lines))
 
         await update.message.reply_poll(
-            question=question_text[:300],
+            question="Сегодня играем в WZ?",
             options=["✅ 20:00", "❌ Нет"],
             is_anonymous=False,
             allows_multiple_answers=False,
