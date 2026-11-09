@@ -32,7 +32,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ========== HTTP-СЕРВЕР ДЛЯ RENDER ==========
+# ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD для UptimeRobot) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -54,16 +54,22 @@ threading.Thread(target=run_http_server, daemon=True).start()
 
 # ========== KEEP-ALIVE ==========
 def keep_alive():
+    """Пингует Render и Telegram каждые 15 минут, чтобы сервис не засыпал."""
     while True:
         time.sleep(900)
         try:
-            httpx.get(os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"), timeout=10)
-        except: pass
+            httpx.get(
+                os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"),
+                timeout=10,
+            )
+        except Exception:
+            pass
         try:
             token = os.environ.get("BOT_TOKEN")
             if token:
                 httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-        except: pass
+        except Exception:
+            pass
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
@@ -71,7 +77,7 @@ threading.Thread(target=keep_alive, daemon=True).start()
 def parse_warzone_posts(limit: int = 5):
     """
     Парсит страницу блога Warzone и возвращает список постов:
-    [{"title": "...", "date": "...", "summary": "...", "url": "..."}, ...]
+    [{"title": ..., "date": ..., "summary": ..., "url": ...}, ...]
     """
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=HEADERS, timeout=25, follow_redirects=True)
@@ -97,7 +103,10 @@ def parse_warzone_posts(limit: int = 5):
             summary = sub.get_text(strip=True) if sub else ""
 
             posts.append({
-                "title": title, "date": date, "summary": summary, "url": url,
+                "title": title,
+                "date": date,
+                "summary": summary,
+                "url": url,
             })
             if len(posts) >= limit:
                 break
@@ -109,7 +118,8 @@ def parse_warzone_posts(limit: int = 5):
 # ========== LLM ==========
 async def get_llm_summary(posts):
     """
-    Отправляет посты в LLM. Возвращает красивый ответ на русском БЕЗ ссылок.
+    Отправляет посты в LLM. Возвращает краткую сводку на русском без ссылок
+    и без искусственных оценок «обновление есть/нет».
     """
     if not posts:
         return None
@@ -125,16 +135,15 @@ async def get_llm_summary(posts):
     prompt = (
         "Ты — краткий новостной ассистент для русскоязычного игрового чата по Call of Duty: Warzone.\n"
         "Ниже — свежие посты с официального блога Warzone.\n\n"
-        "Твоя задача — выбрать ОДИН самый важный пост (обновление, новый сезон, патч, важная новость) "
-        "и дать краткую сводку в таком формате:\n\n"
-        "🔧 Обновление: [есть/нет] — если есть, одна короткая фраза о сути (без даты, без ссылки).\n"
-        "📰 Новость: одна короткая фраза о самом интересном (без ссылки).\n\n"
+        "Твоя задача — выбрать ОДИН самый важный пост (новая карта, сезон, оружие, режим, событие) "
+        "и пересказать его суть в 1–2 коротких предложениях.\n\n"
         "ПРАВИЛА:\n"
         "— Отвечай ТОЛЬКО на русском языке.\n"
         "— НЕ добавляй ссылки, URL, домены.\n"
+        "— НЕ пиши «Обновление: есть/нет» и подобные оценки.\n"
         "— Не пиши вступления вроде «Конечно» или «Вот».\n"
-        "— Максимум 3 строки.\n"
-        "— Используй эмодзи 🔧 и 📰 строго как в шаблоне выше.\n\n"
+        "— Максимум 2 предложения.\n"
+        "— Начни с одного эмодзи по смыслу (🎮, 🗺️, 🔫, 🏆, 📰 и т.п.).\n\n"
         f"Посты:\n{news_text}"
     )
 
@@ -142,14 +151,24 @@ async def get_llm_summary(posts):
         response = openrouter_client.chat.completions.create(
             model="openrouter/free",
             messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без вступлений."},
-                {"role": "user", "content": prompt}
+                {
+                    "role": "system",
+                    "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет».",
+                },
+                {"role": "user", "content": prompt},
             ],
-            timeout=40
+            timeout=40,
         )
         answer = response.choices[0].message.content.strip()
+        # Чистим возможные английские вступления, ссылки и шаблон «Обновление: есть/нет»
         answer = re.sub(r"^(Sure|Of course|Here.*?:)\s*", "", answer, flags=re.IGNORECASE)
         answer = re.sub(r"https?://\S+", "", answer).strip()
+        answer = re.sub(
+            r"🔧?\s*Обновление\s*:\s*(есть|нет)\s*[—\-–]?\s*",
+            "",
+            answer,
+            flags=re.IGNORECASE,
+        ).strip()
         return answer
     except Exception as e:
         logging.error(f"Ошибка OpenRouter: {e}")
@@ -163,14 +182,24 @@ CHAT_ID = int(os.environ.get("CHAT_ID", 0))
 try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
-except:
+except Exception:
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=20, minute=0, tzinfo=timezone('Europe/Moscow'))
+    logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 20:00")
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+if not TOKEN:
+    raise ValueError("❌ BOT_TOKEN не задан! Добавьте его в переменные окружения.")
+if not CHAT_ID:
+    raise ValueError("❌ CHAT_ID не задан! Добавьте его в переменные окружения.")
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА ОПРОСА ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет опрос каждый день с краткой сводкой новостей Warzone."""
     try:
         posts = parse_warzone_posts(limit=5)
         summary = await get_llm_summary(posts)
@@ -191,12 +220,14 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start."""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
         f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с новостями Warzone."
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Ручной запуск опроса командой /poll."""
     try:
         posts = parse_warzone_posts(limit=5)
         summary = await get_llm_summary(posts)
@@ -218,6 +249,7 @@ if __name__ == "__main__":
     logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
 
     application = Application.builder().token(TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("poll", poll_now))
 
