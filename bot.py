@@ -10,8 +10,13 @@ from pytz import timezone
 
 import httpx
 from bs4 import BeautifulSoup
-from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    CallbackQueryHandler,
+    ContextTypes,
+)
 from openai import OpenAI
 
 # ========== НАСТРОЙКИ ==========
@@ -27,7 +32,6 @@ openrouter_client = OpenAI(
 WARZONE_BLOG_URL = "https://www.callofduty.com/blog/warzone"
 METARADAR_API_URL = "https://metaradar.gg/api/v1/meta/warzone"
 
-# Таймаут для всех HTTP-запросов (80 секунд)
 HTTP_TIMEOUT = 80
 
 HEADERS = {
@@ -44,7 +48,7 @@ BLOG_HEADERS = {
 
 LAST_NEWS_FILE = "last_news.json"
 
-# ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD для UptimeRobot) ==========
+# ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -66,14 +70,10 @@ threading.Thread(target=run_http_server, daemon=True).start()
 
 # ========== KEEP-ALIVE ==========
 def keep_alive():
-    """Пингует Render и Telegram каждые 15 минут, чтобы сервис не засыпал."""
     while True:
         time.sleep(900)
         try:
-            httpx.get(
-                os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"),
-                timeout=10,
-            )
+            httpx.get(os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"), timeout=10)
         except Exception:
             pass
         try:
@@ -87,7 +87,6 @@ threading.Thread(target=keep_alive, daemon=True).start()
 
 # ========== ФАЙЛ ДЛЯ ДАТЫ ПОСЛЕДНЕЙ НОВОСТИ ==========
 def save_last_news_date(date_str: str):
-    """Сохраняет дату последней найденной новости."""
     try:
         with open(LAST_NEWS_FILE, "w", encoding="utf-8") as f:
             json.dump({"last_date": date_str}, f, ensure_ascii=False)
@@ -95,7 +94,6 @@ def save_last_news_date(date_str: str):
         logging.warning(f"Не удалось сохранить дату новости: {e}")
 
 def load_last_news_date():
-    """Загружает дату последней найденной новости."""
     try:
         if os.path.exists(LAST_NEWS_FILE):
             with open(LAST_NEWS_FILE, "r", encoding="utf-8") as f:
@@ -121,20 +119,14 @@ def get_latest_post_date():
         logging.warning(f"Не удалось получить дату последнего поста: {e}")
     return None
 
-# ========== ПАРСИНГ БЛОГА (только за последние 24 часа) ==========
+# ========== ПАРСИНГ БЛОГА ==========
 def parse_warzone_posts_fresh(limit: int = 5):
-    """
-    Парсит страницу блога Warzone и возвращает ТОЛЬКО посты,
-    опубликованные за последние 24 часа.
-    """
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
         cards = soup.select("div.blog-card-item")
-        logging.info(f"Warzone blog: найдено карточек {len(cards)}")
-
         now = datetime.datetime.now(datetime.timezone.utc)
         fresh_posts = []
 
@@ -157,8 +149,7 @@ def parse_warzone_posts_fresh(limit: int = 5):
                 post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
                 if (now - post_date).total_seconds() > 24 * 3600:
                     continue
-            except Exception as e:
-                logging.warning(f"Не удалось распарсить дату '{date_str}': {e}")
+            except Exception:
                 continue
 
             sub = card.select_one(".subtitle")
@@ -174,14 +165,11 @@ def parse_warzone_posts_fresh(limit: int = 5):
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
         return []
 
-# ========== ПАРСИНГ МЕТЫ (MetaRadar API) ==========
-def parse_meta():
+# ========== ПАРСИНГ МЕТЫ ==========
+def parse_meta_raw():
     """
-    Получает мету через официальный API MetaRadar.
-    Возвращает многострочную строку:
-      🎯 Long Range: A, B, C
-      🔫 Close Range: D, E, F
-      🎯 Sniper: G, H, I
+    Возвращает словарь {категория: [список имён]}.
+    Используется и для текста, и для кнопок.
     """
     try:
         response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
@@ -194,43 +182,97 @@ def parse_meta():
             return None
 
         groups = {"Long range": [], "Close range": [], "Sniper": []}
-
         for w in weapons:
-            role = w.get("role", "") or ""
+            role = (w.get("role") or "").lower()
             name = w.get("name", "").strip()
             if not name:
                 continue
-            if "long range" in role.lower():
+            if "long range" in role:
                 groups["Long range"].append(name)
-            elif "close range" in role.lower():
+            elif "close range" in role:
                 groups["Close range"].append(name)
-            elif "sniper" in role.lower():
+            elif "sniper" in role:
                 groups["Sniper"].append(name)
 
-        lines = []
-        labels = {
-            "Long range": "🎯 Long Range",
-            "Close range": "🔫 Close Range",
-            "Sniper": "🎯 Sniper",
+        return {
+            "Long range": groups["Long range"][:3],
+            "Close range": groups["Close range"][:3],
+            "Sniper": groups["Sniper"][:3],
         }
-        for key, items in groups.items():
-            if items:
-                top3 = ", ".join(items[:3])
-                lines.append(f"{labels[key]}: {top3}")
-
-        if lines:
-            result = "\n".join(lines)
-            logging.info(f"Мета спарсена (MetaRadar):\n{result}")
-            return result
-        else:
-            logging.warning("MetaRadar: не удалось сгруппировать оружие по ролям")
-            return None
-
     except Exception as e:
         logging.warning(f"Ошибка MetaRadar API: {e}")
         return None
 
-# ========== LLM ==========
+def build_meta_message(groups: dict) -> str:
+    """Собирает HTML-сообщение с жирными названиями оружия."""
+    if not groups:
+        return "🎯 Мета временно недоступна"
+
+    labels = {
+        "Long range": "🎯 Long Range",
+        "Close range": "🔫 Close Range",
+        "Sniper": "🔭 Sniper",
+    }
+    lines = []
+    for key, items in groups.items():
+        if items:
+            bold_names = ", ".join(f"<b>{n}</b>" for n in items)
+            lines.append(f"{labels[key]}: {bold_names}")
+    return "\n".join(lines)
+
+def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
+    """Создаёт inline-кнопки: одна строка — одна категория, кнопки по оружиям."""
+    rows = []
+    for key, items in groups.items():
+        if not items:
+            continue
+        row = []
+        for name in items:
+            # callback_data ограничен 64 байтами — названия оружия влезают
+            row.append(InlineKeyboardButton(name, callback_data=f"build|{name}"))
+        rows.append(row)
+    return InlineKeyboardMarkup(rows)
+
+# ========== LLM ДЛЯ СБОРКИ ОРУЖИЯ ==========
+async def get_weapon_build(weapon_name: str) -> str:
+    """
+    Спрашивает LLM об актуальной сборке для оружия.
+    Ответ на русском, без ссылок, кратко.
+    """
+    prompt = (
+        f"Ты — эксперт по Call of Duty: Warzone. Дай актуальную мета-сборку для оружия «{weapon_name}».\n\n"
+        "ФОРМАТ ОТВЕТА (строго):\n"
+        "🔫 <b>{weapon_name}</b>\n"
+        "• Дуло: ...\n"
+        "• Ствол: ...\n"
+        "• Прицел: ...\n"
+        "• Магазин: ...\n"
+        "• Рукоятка/приклад: ...\n\n"
+        "ПРАВИЛА:\n"
+        "— Отвечай ТОЛЬКО на русском языке.\n"
+        "— НЕ добавляй ссылки, URL.\n"
+        "— Не пиши вступления.\n"
+        "— Максимум 6 строк.\n"
+        "— Если не знаешь актуальную сборку — напиши «Нет данных по этой сборке».\n"
+    )
+
+    try:
+        response = openrouter_client.chat.completions.create(
+            model="openrouter/free",
+            messages=[
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок."},
+                {"role": "user", "content": prompt},
+            ],
+            timeout=HTTP_TIMEOUT,
+        )
+        answer = response.choices[0].message.content.strip()
+        answer = re.sub(r"https?://\S+", "", answer).strip()
+        return answer
+    except Exception as e:
+        logging.error(f"Ошибка LLM (сборка): {e}")
+        return f"⚠️ Не удалось получить сборку для «{weapon_name}». Попробуйте позже."
+
+# ========== LLM ДЛЯ НОВОСТЕЙ ==========
 async def get_llm_summary(posts):
     if not posts:
         return None
@@ -250,7 +292,7 @@ async def get_llm_summary(posts):
         "— НЕ пиши «Обновление: есть/нет» и подобные оценки.\n"
         "— Не пиши вступления вроде «Конечно» или «Вот».\n"
         "— Максимум 2 предложения.\n"
-        "— Начни с одного эмодзи по смыслу (🎮, 🗺️, 🔫, 🏆, 📰 и т.п.).\n\n"
+        "— Начни с одного эмодзи по смыслу.\n\n"
         f"Посты:\n{news_text}"
     )
 
@@ -292,107 +334,121 @@ if not CHAT_ID:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== ОТПРАВКА ОПРОСА ==========
-async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет мету/новости отдельным сообщением, затем короткий опрос."""
-    try:
-        posts = parse_warzone_posts_fresh(limit=5)
-        summary = await get_llm_summary(posts)
-        meta = parse_meta()
+# ========== ОТПРАВКА МЕТЫ + НОВОСТЕЙ ==========
+async def send_meta_and_news(context_or_update, is_command: bool = False):
+    """
+    Отправляет два сообщения:
+    1. Мета с кнопками (HTML, жирные названия).
+    2. Новости (обычное сообщение).
+    Плюс опрос отдельно.
+    """
+    posts = parse_warzone_posts_fresh(limit=5)
+    summary = await get_llm_summary(posts)
+    groups = parse_meta_raw()
 
-        # 1. Собираем блок с метой и новостями
-        info_lines = []
-        if meta:
-            info_lines.append(meta)
+    bot = context_or_update.bot if hasattr(context_or_update, "bot") else context_or_update.get_bot()
+    chat_id = CHAT_ID if not is_command else context_or_update.effective_chat.id
 
-        if summary and posts:
-            latest_date = posts[0].get("date", "")
-            if latest_date:
-                save_last_news_date(latest_date)
-            info_lines.append(f"📰 News: {summary}")
-        else:
-            last_date = load_last_news_date()
-            if not last_date:
-                # Резерв: берём дату самого свежего поста с блога
-                last_date = get_latest_post_date()
-                if last_date:
-                    save_last_news_date(last_date)
-            if last_date:
-                info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
-            else:
-                info_lines.append("📰 News: Nothing New")
-
-        # 2. Отправляем обычным сообщением (переносы строк работают)
-        if info_lines:
-            await context.bot.send_message(
-                chat_id=CHAT_ID,
-                text="\n\n".join(info_lines),
-            )
-
-        # 3. Отправляем короткий опрос
-        await context.bot.send_poll(
-            chat_id=CHAT_ID,
-            question="Сегодня играем в WZ?",
-            options=["✅ 20:00", "❌ Нет"],
-            is_anonymous=False,
-            allows_multiple_answers=False,
+    # 1. Сообщение с метой и кнопками
+    if groups:
+        meta_text = build_meta_message(groups)
+        keyboard = build_meta_keyboard(groups)
+        await bot.send_message(
+            chat_id=chat_id,
+            text=meta_text,
+            parse_mode="HTML",
+            reply_markup=keyboard,
         )
-        logger.info(f"✅ Опрос отправлен. Мета: {'да' if meta else 'нет'}, Новости: {'да' if summary else 'нет'}")
+    else:
+        await bot.send_message(chat_id=chat_id, text="🎯 Мета временно недоступна")
+
+    # 2. Сообщение с новостями
+    if summary and posts:
+        latest_date = posts[0].get("date", "")
+        if latest_date:
+            save_last_news_date(latest_date)
+        news_text = f"📰 News: {summary}"
+    else:
+        last_date = load_last_news_date()
+        if not last_date:
+            last_date = get_latest_post_date()
+            if last_date:
+                save_last_news_date(last_date)
+        if last_date:
+            news_text = f"📰 News: Nothing New (последняя: {last_date})"
+        else:
+            news_text = "📰 News: Nothing New"
+
+    await bot.send_message(chat_id=chat_id, text=news_text)
+
+    # 3. Опрос
+    await bot.send_poll(
+        chat_id=chat_id,
+        question="Сегодня играем в WZ?",
+        options=["✅ 20:00", "❌ Нет"],
+        is_anonymous=False,
+        allows_multiple_answers=False,
+    )
+    logger.info(f"✅ Мета + новости + опрос отправлены. Мета: {'да' if groups else 'нет'}, Новости: {'да' if summary else 'нет'}")
+
+# ========== ХЕНДЛЕРЫ ==========
+async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        await send_meta_and_news(context, is_command=False)
     except Exception as e:
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
-        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone."
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone.\n"
+        f"Нажмите на кнопку с оружием, чтобы получить актуальную сборку."
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной запуск опроса командой /poll."""
     try:
-        posts = parse_warzone_posts_fresh(limit=5)
-        summary = await get_llm_summary(posts)
-        meta = parse_meta()
-
-        info_lines = []
-        if meta:
-            info_lines.append(meta)
-
-        if summary and posts:
-            latest_date = posts[0].get("date", "")
-            if latest_date:
-                save_last_news_date(latest_date)
-            info_lines.append(f"📰 News: {summary}")
-        else:
-            last_date = load_last_news_date()
-            if not last_date:
-                last_date = get_latest_post_date()
-                if last_date:
-                    save_last_news_date(last_date)
-            if last_date:
-                info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
-            else:
-                info_lines.append("📰 News: Nothing New")
-
-        if info_lines:
-            await update.message.reply_text("\n\n".join(info_lines))
-
-        await update.message.reply_poll(
-            question="Сегодня играем в WZ?",
-            options=["✅ 20:00", "❌ Нет"],
-            is_anonymous=False,
-            allows_multiple_answers=False,
-        )
+        await send_meta_and_news(update, is_command=True)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
+async def on_weapon_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик нажатия на кнопку с оружием."""
+    query = update.callback_query
+    await query.answer()  # убираем "часики" на кнопке
+
+    data = query.data or ""
+    if not data.startswith("build|"):
+        return
+    weapon_name = data.split("|", 1)[1]
+
+    # Отдельным сообщением отправляем "загрузка..."
+    loading_msg = await query.message.reply_text(
+        f"⏳ Ищу актуальную сборку для <b>{weapon_name}</b>...",
+        parse_mode="HTML",
+    )
+
+    build = await get_weapon_build(weapon_name)
+
+    # Отправляем ответ отдельным сообщением
+    await query.message.reply_text(
+        f"<b>{weapon_name}</b>\n\n{build}",
+        parse_mode="HTML",
+    )
+    # Удаляем "загрузку"
+    try:
+        await loading_msg.delete()
+    except Exception:
+        pass
+
+# ========== ЗАПУСК ==========
 if __name__ == "__main__":
     logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
 
     application = Application.builder().token(TOKEN).build()
+
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("poll", poll_now))
+    application.add_handler(CallbackQueryHandler(on_weapon_button, pattern=r"^build\|"))
 
     job_queue = application.job_queue
     job_queue.run_daily(send_daily_poll, time=ВРЕМЯ_ОТПРАВКИ, days=tuple(range(7)))
