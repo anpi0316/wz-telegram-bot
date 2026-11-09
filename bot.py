@@ -24,6 +24,7 @@ openrouter_client = OpenAI(
 )
 
 WARZONE_BLOG_URL = "https://www.callofduty.com/blog/warzone"
+META_URL = "https://warzoneloadout.games/"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -32,7 +33,7 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
-# ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD для UptimeRobot) ==========
+# ========== HTTP-СЕРВЕР ДЛЯ RENDER ==========
 class SimpleHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
@@ -54,30 +55,24 @@ threading.Thread(target=run_http_server, daemon=True).start()
 
 # ========== KEEP-ALIVE ==========
 def keep_alive():
-    """Пингует Render и Telegram каждые 15 минут, чтобы сервис не засыпал."""
     while True:
         time.sleep(900)
         try:
-            httpx.get(
-                os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"),
-                timeout=10,
-            )
-        except Exception:
-            pass
+            httpx.get(os.environ.get("RENDER_URL", "https://wz-telegram-bot.onrender.com"), timeout=10)
+        except: pass
         try:
             token = os.environ.get("BOT_TOKEN")
             if token:
                 httpx.get(f"https://api.telegram.org/bot{token}/getMe", timeout=10)
-        except Exception:
-            pass
+        except: pass
 
 threading.Thread(target=keep_alive, daemon=True).start()
 
-# ========== ПАРСИНГ WARZONE БЛОГА ==========
-def parse_warzone_posts(limit: int = 5):
+# ========== ПАРСИНГ БЛОГА (только за последние 24 часа) ==========
+def parse_warzone_posts_fresh(limit: int = 5):
     """
-    Парсит страницу блога Warzone и возвращает список постов:
-    [{"title": ..., "date": ..., "summary": ..., "url": ...}, ...]
+    Парсит страницу блога Warzone и возвращает ТОЛЬКО посты,
+    опубликованные за последние 24 часа (по дате на странице).
     """
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=HEADERS, timeout=25, follow_redirects=True)
@@ -87,7 +82,9 @@ def parse_warzone_posts(limit: int = 5):
         cards = soup.select("div.blog-card-item")
         logging.info(f"Warzone blog: найдено карточек {len(cards)}")
 
-        posts = []
+        now = datetime.datetime.now(datetime.timezone.utc)
+        fresh_posts = []
+
         for card in cards:
             title_tag = card.select_one(".title a")
             if not title_tag:
@@ -97,29 +94,87 @@ def parse_warzone_posts(limit: int = 5):
             url = "https://www.callofduty.com" + href if href.startswith("/") else href
 
             date_div = card.select_one(".news-published")
-            date = date_div.get("data-date-loc") if date_div else ""
+            if not date_div:
+                continue
+            date_str = date_div.get("data-date", "")  # например "November 05, 2026"
+            if not date_str:
+                continue
+
+            try:
+                # Парсим дату вида "November 05, 2026"
+                post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
+                age = now - post_date
+                if age.total_seconds() > 24 * 3600:
+                    # Пост старше 24 часов — пропускаем
+                    continue
+            except Exception as e:
+                logging.warning(f"Не удалось распарсить дату '{date_str}': {e}")
+                continue
 
             sub = card.select_one(".subtitle")
             summary = sub.get_text(strip=True) if sub else ""
 
-            posts.append({
+            fresh_posts.append({
                 "title": title,
-                "date": date,
+                "date": date_str,
                 "summary": summary,
                 "url": url,
             })
-            if len(posts) >= limit:
+            if len(fresh_posts) >= limit:
                 break
-        return posts
+
+        logging.info(f"Свежих постов (за 24ч): {len(fresh_posts)}")
+        return fresh_posts
     except Exception as e:
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
         return []
+
+# ========== ПАРСИНГ МЕТЫ ==========
+def parse_meta():
+    """
+    Парсит warzoneloadout.games и извлекает топ-оружие из S-тира.
+    Возвращает строку вида: "Cronen Osprey (Long Range), VEL 46 (Close Range)"
+    """
+    try:
+        response = httpx.get(META_URL, headers=HEADERS, timeout=25, follow_redirects=True)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+
+        # Ищем заголовки оружия в S-тире. По HTML структуре это <h2> внутри блоков
+        # с классом, содержащим "Absolute Meta" или "S Tier".
+        # Универсальный подход: ищем все <h2>, в тексте которых есть "#1"
+        meta_items = []
+        for h2 in soup.find_all("h2"):
+            text = h2.get_text(" ", strip=True)
+            # Пример: "Cronen Osprey#1 Long RangeAssault Riflemw4"
+            # Или: "VEL 46#1 Close RangeSMGModern Warfare 2"
+            if "#1" in text and ("Long Range" in text or "Close Range" in text or "Sniper" in text):
+                # Вытаскиваем имя оружия (до #1) и категорию (Long Range / Close Range / Sniper)
+                name_match = re.match(r"^([^#]+)#1\s*(Long Range|Close Range|Sniper)", text)
+                if name_match:
+                    weapon_name = name_match.group(1).strip()
+                    category = name_match.group(2)
+                    meta_items.append(f"{weapon_name} ({category})")
+
+        if meta_items:
+            # Берём первые 3 (Long Range, Close Range, Sniper)
+            unique = list(dict.fromkeys(meta_items))[:3]
+            result = ", ".join(unique)
+            logging.info(f"Мета спарсена: {result}")
+            return result
+        else:
+            logging.warning("Мета не найдена на странице")
+            return None
+    except Exception as e:
+        logging.warning(f"Ошибка парсинга меты: {e}")
+        return None
 
 # ========== LLM ==========
 async def get_llm_summary(posts):
     """
     Отправляет посты в LLM. Возвращает краткую сводку на русском без ссылок
     и без искусственных оценок «обновление есть/нет».
+    Если постов нет — возвращает None.
     """
     if not posts:
         return None
@@ -134,9 +189,8 @@ async def get_llm_summary(posts):
 
     prompt = (
         "Ты — краткий новостной ассистент для русскоязычного игрового чата по Call of Duty: Warzone.\n"
-        "Ниже — свежие посты с официального блога Warzone.\n\n"
-        "Твоя задача — выбрать ОДИН самый важный пост (новая карта, сезон, оружие, режим, событие) "
-        "и пересказать его суть в 1–2 коротких предложениях.\n\n"
+        "Ниже — свежие посты с официального блога Warzone (только за последние 24 часа).\n\n"
+        "Твоя задача — выбрать ОДИН самый важный пост и пересказать его суть в 1–2 коротких предложениях.\n\n"
         "ПРАВИЛА:\n"
         "— Отвечай ТОЛЬКО на русском языке.\n"
         "— НЕ добавляй ссылки, URL, домены.\n"
@@ -151,24 +205,15 @@ async def get_llm_summary(posts):
         response = openrouter_client.chat.completions.create(
             model="openrouter/free",
             messages=[
-                {
-                    "role": "system",
-                    "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет».",
-                },
-                {"role": "user", "content": prompt},
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без оценок «есть/нет»."},
+                {"role": "user", "content": prompt}
             ],
-            timeout=40,
+            timeout=40
         )
         answer = response.choices[0].message.content.strip()
-        # Чистим возможные английские вступления, ссылки и шаблон «Обновление: есть/нет»
         answer = re.sub(r"^(Sure|Of course|Here.*?:)\s*", "", answer, flags=re.IGNORECASE)
         answer = re.sub(r"https?://\S+", "", answer).strip()
-        answer = re.sub(
-            r"🔧?\s*Обновление\s*:\s*(есть|нет)\s*[—\-–]?\s*",
-            "",
-            answer,
-            flags=re.IGNORECASE,
-        ).strip()
+        answer = re.sub(r"🔧?\s*Обновление\s*:\s*(есть|нет)\s*[—\-–]?\s*", "", answer, flags=re.IGNORECASE).strip()
         return answer
     except Exception as e:
         logging.error(f"Ошибка OpenRouter: {e}")
@@ -182,31 +227,26 @@ CHAT_ID = int(os.environ.get("CHAT_ID", 0))
 try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
-except Exception:
+except:
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=20, minute=0, tzinfo=timezone('Europe/Moscow'))
-    logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 20:00")
 
-if not TOKEN:
-    raise ValueError("❌ BOT_TOKEN не задан! Добавьте его в переменные окружения.")
-if not CHAT_ID:
-    raise ValueError("❌ CHAT_ID не задан! Добавьте его в переменные окружения.")
-
-logging.basicConfig(
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.INFO,
-)
+logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ========== ОТПРАВКА ОПРОСА ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет опрос каждый день с краткой сводкой новостей Warzone."""
     try:
-        posts = parse_warzone_posts(limit=5)
+        posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
+        meta = parse_meta()
 
-        question_text = "Сегодня играем в WZ?"
+        lines = ["Сегодня играем в WZ?"]
+        if meta:
+            lines.append(f"🎯 Мета: {meta}")
         if summary:
-            question_text = f"Сегодня играем в WZ?\n\n{summary}"
+            lines.append(f"📰 {summary}")
+
+        question_text = "\n\n".join(lines)
 
         await context.bot.send_poll(
             chat_id=CHAT_ID,
@@ -215,26 +255,29 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
             is_anonymous=False,
             allows_multiple_answers=False,
         )
-        logger.info(f"✅ Опрос отправлен. Сводка: {'да' if summary else 'нет'}")
+        logger.info(f"✅ Опрос отправлен. Мета: {'да' if meta else 'нет'}, Новости: {'да' if summary else 'нет'}")
     except Exception as e:
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик команды /start."""
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
-        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с новостями Warzone."
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone (если есть за сутки)."
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Ручной запуск опроса командой /poll."""
     try:
-        posts = parse_warzone_posts(limit=5)
+        posts = parse_warzone_posts_fresh(limit=5)
         summary = await get_llm_summary(posts)
+        meta = parse_meta()
 
-        question_text = "Сегодня играем в WZ?"
+        lines = ["Сегодня играем в WZ?"]
+        if meta:
+            lines.append(f"🎯 Мета: {meta}")
         if summary:
-            question_text = f"Сегодня играем в WZ?\n\n{summary}"
+            lines.append(f"📰 {summary}")
+
+        question_text = "\n\n".join(lines)
 
         await update.message.reply_poll(
             question=question_text[:300],
@@ -249,7 +292,6 @@ if __name__ == "__main__":
     logger.info(f"🚀 Запуск бота... Время опроса: {ВРЕМЯ_ОТПРАВКИ_STR}")
 
     application = Application.builder().token(TOKEN).build()
-
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("poll", poll_now))
 
