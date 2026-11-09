@@ -50,6 +50,8 @@ LAST_NEWS_FILE = "last_news.json"
 
 # Глобальный кэш сборок из MetaRadar
 WEAPON_BUILDS = {}
+# Глобальный кэш топ-3 по ролям
+META_GROUPS = {}
 
 # Хранилище последнего опроса (message_id) для анализа
 LAST_POLL_MESSAGE_ID = None
@@ -110,7 +112,6 @@ def load_last_news_date():
     return None
 
 def get_latest_post_date():
-    """Возвращает дату самого свежего поста на блоге (даже если он старше 24ч)."""
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
@@ -171,9 +172,8 @@ def parse_warzone_posts_fresh(limit: int = 5):
         logging.warning(f"Ошибка парсинга Warzone блога: {e}")
         return []
 
-# ========== ПАРСИНГ БЛОГА (последние, без фильтра по 24ч) ==========
+# ========== ПАРСИНГ БЛОГА (последние, без 24ч) ==========
 def parse_warzone_posts_latest(limit: int = 5):
-    """Возвращает последние посты с блога, без фильтра по 24 часам."""
     try:
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
@@ -207,7 +207,7 @@ def parse_warzone_posts_latest(limit: int = 5):
 
 # ========== ПАРСИНГ МЕТЫ (MetaRadar API) ==========
 def parse_meta_raw():
-    global WEAPON_BUILDS
+    global WEAPON_BUILDS, META_GROUPS
     try:
         response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
@@ -238,11 +238,12 @@ def parse_meta_raw():
             elif "sniper" in role:
                 groups["Sniper"].append(name)
 
-        return {
+        META_GROUPS = {
             "Long range": groups["Long range"][:3],
             "Close range": groups["Close range"][:3],
             "Sniper": groups["Sniper"][:3],
         }
+        return META_GROUPS
     except Exception as e:
         logging.warning(f"Ошибка MetaRadar API: {e}")
         return None
@@ -352,21 +353,21 @@ async def get_llm_summary(posts):
 
 # ========== КОМАНДА /ask ==========
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет вопрос в LLM, подмешивая последние посты блога (без фильтра 24ч) и сборки."""
+    """Отправляет вопрос в LLM, подмешивая последние посты блога и мету из MetaRadar."""
     question = " ".join(context.args).strip() if context.args else ""
 
     if not question:
         await update.message.reply_text(
             "🤔 Напишите вопрос после команды, например:\n"
             "<code>/ask какая сейчас мета?</code>\n"
-            "<code>/ask подбери сборку для Signal 50</code>",
+            "<code>/ask посоветуй пушку для long range</code>",
             parse_mode="HTML",
         )
         return
 
     loading_msg = await update.message.reply_text("⏳ Думаю над ответом…")
 
-    # 1. Последние посты из блога (без фильтра по 24ч)
+    # 1. Последние посты из блога
     posts = parse_warzone_posts_latest(limit=5)
     news_context = ""
     if posts:
@@ -377,9 +378,29 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if last_date:
             news_context = f"Свежих новостей нет. Последняя была: {last_date}."
 
-    # 2. Ищем сборку, если вопрос про оружие
-    weapon_context = ""
     question_lower = question.lower()
+
+    # 2. Если вопрос про мету / пушку — подставляем топ-3 по ролям из META_GROUPS
+    meta_keywords = ["мета", "meta", "long range", "close range", "дальн", "ближн",
+                     "посоветуй пушку", "какую пушку", "лучшая пушка", "топ пушк",
+                     "снайпер", "sniper", "smg", "assault rifle"]
+    meta_context = ""
+    if any(kw in question_lower for kw in meta_keywords):
+        if META_GROUPS:
+            labels = {
+                "Long range": "Long Range",
+                "Close range": "Close Range",
+                "Sniper": "Sniper",
+            }
+            meta_lines = []
+            for key, items in META_GROUPS.items():
+                if items:
+                    meta_lines.append(f"— {labels[key]}: {', '.join(items)}")
+            if meta_lines:
+                meta_context = "\n".join(meta_lines)
+
+    # 3. Если вопрос про конкретное оружие — подставляем его сборку
+    weapon_context = ""
     for weapon_name in WEAPON_BUILDS.keys():
         if weapon_name.lower() in question_lower:
             build = WEAPON_BUILDS[weapon_name]
@@ -397,38 +418,39 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     weapon_context += f"\n  Share code: {share}"
             break
 
-    # 3. Текущая дата
+    # 4. Текущая дата
     now_msk = datetime.datetime.now(timezone('Europe/Moscow'))
     today_str = now_msk.strftime("%d %B %Y")
 
-    # 4. Формируем промпт
+    # 5. Формируем промпт (вопрос — в начале, чтобы модель его не теряла)
     prompt = (
-        f"Сегодня {today_str} (МСК).\n"
+        f"Сегодня {today_str} (МСК).\n\n"
+        f"ВОПРОС ИГРОКА: {question}\n\n"
         "Ты — опытный эксперт по Call of Duty: Warzone. "
         "Отвечай кратко, по делу, на русском языке.\n\n"
         "ПРАВИЛА:\n"
         "— Только русский язык.\n"
         "— Без ссылок, URL, доменов.\n"
         "— Не пиши вступления вроде «Конечно» или «Вот».\n"
-        "— Максимум 4–5 предложений.\n"
-        "— Если контекст не содержит ответа на вопрос — ответь из своих общих знаний о Warzone.\n\n"
-        "Не выдумывай то, чего нет в контексте.\n\n"
+        "— Максимум 5–6 предложений.\n"
+        "— Если ниже есть блок «АКТУАЛЬНАЯ МЕТА» — используй его как основной источник. "
+        "Если вопрос про long range — назови пушку из строки Long Range. "
+        "Если про close range — из Close Range. "
+        "Не говори «мета не установилась», если данные есть.\n\n"
     )
 
-    if news_context:
-        prompt += f"ПОСЛЕДНИЕ НОВОСТИ WARZONE (из официального блога):\n{news_context}\n\n"
+    if meta_context:
+        prompt += f"АКТУАЛЬНАЯ МЕТА (из MetaRadar, обновляется ежедневно):\n{meta_context}\n\n"
     if weapon_context:
         prompt += f"ДАННЫЕ ПО ОРУЖИЮ:\n{weapon_context}\n\n"
-
-    prompt += f"Вопрос игрока: {question}"
+    if news_context:
+        prompt += f"ПОСЛЕДНИЕ НОВОСТИ WARZONE (из официального блога):\n{news_context}\n\n"
 
     try:
         response = openrouter_client.chat.completions.create(
             model="nvidia/nemotron-3.5-super-vl:free",
             messages=[
-                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. "
-"Используй факты из контекста, если они есть. Если в контексте нет ответа — "
-"ответь из своих знаний, но не выдумывай даты и события, которых не знаешь."},
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок. Используй факты из контекста, если они есть. Если контекста нет — ответь из своих знаний."},
                 {"role": "user", "content": prompt},
             ],
             timeout=HTTP_TIMEOUT,
@@ -452,28 +474,20 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ========== АНАЛИЗ ОПРОСА ЧЕРЕЗ ЧАС ==========
 async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
-    """Останавливает опрос и, если голосов >= 5, просит LLM дать комментарий."""
     global LAST_POLL_MESSAGE_ID
     if not LAST_POLL_MESSAGE_ID:
-        logging.info("analyze_poll: нет сохранённого message_id опроса")
         return
 
     try:
-        poll = await context.bot.stop_poll(
-            chat_id=CHAT_ID,
-            message_id=LAST_POLL_MESSAGE_ID,
-        )
+        poll = await context.bot.stop_poll(chat_id=CHAT_ID, message_id=LAST_POLL_MESSAGE_ID)
         total = poll.total_voter_count
         logging.info(f"Опрос остановлен. Всего голосов: {total}")
 
         if total < 5:
-            logging.info(f"Голосов меньше 5 ({total}), комментарий не отправляем")
             LAST_POLL_MESSAGE_ID = None
             return
 
-        stats_lines = []
-        for opt in poll.options:
-            stats_lines.append(f"— {opt.text}: {opt.voter_count}")
+        stats_lines = [f"— {opt.text}: {opt.voter_count}" for opt in poll.options]
         stats_text = "\n".join(stats_lines)
 
         prompt = (
@@ -482,14 +496,8 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
             f"{stats_text}\n\n"
             "Дай ОДИН короткий комментарий (1–2 предложения) на русском.\n"
             "Если большинство за «20:00» — порадуйся, что состав собирается.\n"
-            "Если большинство за «Нет» или поровну — мягко предложи передумать: "
-            "«может, всё-таки залетите хоть на часок».\n"
-            "ПРАВИЛА:\n"
-            "— Только русский язык.\n"
-            "— Без ссылок.\n"
-            "— Без имён и обращений к конкретным людям.\n"
-            "— Максимум 2 предложения.\n"
-            "— Начни с эмодзи по смыслу.\n"
+            "Если большинство за «Нет» или поровну — мягко предложи передумать.\n"
+            "ПРАВИЛА: только русский, без ссылок, без имён, максимум 2 предложения, начни с эмодзи."
         )
 
         try:
@@ -504,15 +512,13 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
             comment = response.choices[0].message.content.strip()
             comment = re.sub(r"https?://\S+", "", comment).strip()
         except Exception as e:
-            logging.error(f"Ошибка LLM (комментарий к опросу): {e}")
+            logging.error(f"Ошибка LLM (комментарий): {e}")
             comment = ""
 
         if comment:
             await context.bot.send_message(chat_id=CHAT_ID, text=comment)
-            logging.info(f"Комментарий к опросу отправлен: {comment[:80]}...")
 
         LAST_POLL_MESSAGE_ID = None
-
     except Exception as e:
         logging.error(f"Ошибка analyze_poll: {e}")
 
@@ -526,7 +532,6 @@ try:
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
 except Exception:
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=20, minute=0, tzinfo=timezone('Europe/Moscow'))
-    logging.warning(f"Неверный формат времени '{ВРЕМЯ_ОТПРАВКИ_STR}', используется 20:00")
 
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не задан!")
@@ -546,7 +551,6 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
 
     bot = context.bot
 
-    # 1. Мета с кнопками
     if groups:
         meta_text = build_meta_message(groups)
         keyboard = build_meta_keyboard(groups)
@@ -554,7 +558,6 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
     else:
         await bot.send_message(chat_id=chat_id, text="🎯 Мета временно недоступна")
 
-    # 2. Новости
     if summary and posts:
         latest_date = posts[0].get("date", "")
         if latest_date:
@@ -569,7 +572,6 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
         news_text = f"📰 News: Nothing New (последняя: {last_date})" if last_date else "📰 News: Nothing New"
     await bot.send_message(chat_id=chat_id, text=news_text)
 
-    # 3. Опрос — сохраняем message_id
     sent_poll = await bot.send_poll(
         chat_id=chat_id,
         question="Сегодня играем в WZ?",
@@ -579,14 +581,8 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
     )
     LAST_POLL_MESSAGE_ID = sent_poll.message_id
 
-    # 4. Планируем анализ через 1 час
     if context.job_queue:
-        context.job_queue.run_once(
-            analyze_poll,
-            when=3600,
-            name=f"poll_analysis_{sent_poll.message_id}",
-        )
-        logging.info(f"Анализ опроса запланирован через 1 час (message_id={LAST_POLL_MESSAGE_ID})")
+        context.job_queue.run_once(analyze_poll, when=3600, name=f"poll_analysis_{sent_poll.message_id}")
 
     logger.info(f"✅ Мета + новости + опрос отправлены. Мета: {'да' if groups else 'нет'}, Новости: {'да' if summary else 'нет'}")
 
