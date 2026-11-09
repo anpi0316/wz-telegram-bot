@@ -105,6 +105,22 @@ def load_last_news_date():
         logging.warning(f"Не удалось загрузить дату новости: {e}")
     return None
 
+def get_latest_post_date():
+    """Возвращает дату самого свежего поста на блоге (даже если он старше 24ч)."""
+    try:
+        response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
+        response.raise_for_status()
+        soup = BeautifulSoup(response.text, "html.parser")
+        first_card = soup.select_one("div.blog-card-item")
+        if not first_card:
+            return None
+        date_div = first_card.select_one(".news-published")
+        if date_div:
+            return date_div.get("data-date")
+    except Exception as e:
+        logging.warning(f"Не удалось получить дату последнего поста: {e}")
+    return None
+
 # ========== ПАРСИНГ БЛОГА (только за последние 24 часа) ==========
 def parse_warzone_posts_fresh(limit: int = 5):
     """
@@ -296,6 +312,11 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
             info_lines.append(f"📰 News: {summary}")
         else:
             last_date = load_last_news_date()
+            if not last_date:
+                # Резерв: берём дату самого свежего поста с блога
+                last_date = get_latest_post_date()
+                if last_date:
+                    save_last_news_date(last_date)
             if last_date:
                 info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
             else:
@@ -345,6 +366,10 @@ async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
             info_lines.append(f"📰 News: {summary}")
         else:
             last_date = load_last_news_date()
+            if not last_date:
+                last_date = get_latest_post_date()
+                if last_date:
+                    save_last_news_date(last_date)
             if last_date:
                 info_lines.append(f"📰 News: Nothing New (последняя: {last_date})")
             else:
