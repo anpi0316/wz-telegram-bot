@@ -173,9 +173,6 @@ def parse_warzone_posts_fresh(limit: int = 5):
 
 # ========== ПАРСИНГ МЕТЫ (MetaRadar API) ==========
 def parse_meta_raw():
-    """
-    Возвращает словарь {категория: [топ-3 оружия]} и заполняет WEAPON_BUILDS.
-    """
     global WEAPON_BUILDS
     try:
         response = httpx.get(METARADAR_API_URL, headers=HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
@@ -245,15 +242,6 @@ def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
 
 # ========== СБОРКА ИЗ METARADAR (БЕЗ LLM) ==========
 async def get_weapon_build(weapon_name: str) -> str:
-    """
-    Возвращает сборку из MetaRadar API.
-    build = {
-        "label": "Long range",
-        "attachments": [{"slot": "Optic", "name": "Cronen R808"}, ...],
-        "shareCode": "A03-3KB4J-BPH2Q-FL11",
-        "updatedAt": "..."
-    }
-    """
     build = WEAPON_BUILDS.get(weapon_name)
     if not build:
         return f"🔫 <b>{weapon_name}</b>\n\nНет данных по этой сборке."
@@ -327,6 +315,66 @@ async def get_llm_summary(posts):
     except Exception as e:
         logging.error(f"Ошибка OpenRouter: {e}")
         return None
+
+# ========== КОМАНДА /ask ==========
+async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Отправляет вопрос в LLM с контекстом «эксперт по Warzone» и текущей датой."""
+    question = " ".join(context.args).strip() if context.args else ""
+
+    if not question:
+        await update.message.reply_text(
+            "🤔 Напишите вопрос после команды, например:\n"
+            "<code>/ask какая сейчас мета?</code>\n"
+            "<code>/ask когда было последнее обновление?</code>",
+            parse_mode="HTML",
+        )
+        return
+
+    loading_msg = await update.message.reply_text("⏳ Думаю над ответом…")
+
+    # Текущая дата в Москве
+    now_msk = datetime.datetime.now(timezone('Europe/Moscow'))
+    today_str = now_msk.strftime("%d %B %Y")  # например "09 November 2026"
+
+    prompt = (
+        f"Сегодня {today_str} (МСК).\n"
+        "Ты — опытный эксперт по Call of Duty: Warzone. "
+        "Отвечай кратко, по делу, на русском языке.\n\n"
+        "ПРАВИЛА:\n"
+        "— Только русский язык.\n"
+        "— Без ссылок, URL, доменов.\n"
+        "— Не пиши вступления вроде «Конечно» или «Вот».\n"
+        "— Максимум 5–6 предложений.\n"
+        "— Если вопрос про обновления или даты — используй сегодняшнюю дату как точку отсчёта. "
+        "Если не знаешь точной даты последнего обновления — скажи «Не уверен в точной дате, но...» и дай общий ответ.\n\n"
+        f"Вопрос игрока: {question}"
+    )
+
+    try:
+        response = openrouter_client.chat.completions.create(
+            model="openrouter/free",
+            messages=[
+                {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок."},
+                {"role": "user", "content": prompt},
+            ],
+            timeout=HTTP_TIMEOUT,
+        )
+        answer = response.choices[0].message.content.strip()
+        answer = re.sub(r"^(Sure|Of course|Here.*?:)\s*", "", answer, flags=re.IGNORECASE)
+        answer = re.sub(r"https?://\S+", "", answer).strip()
+
+        if not answer:
+            answer = "⚠️ Не удалось получить ответ. Попробуйте переформулировать вопрос."
+
+        await update.message.reply_text(answer)
+    except Exception as e:
+        logging.error(f"Ошибка LLM (/ask): {e}")
+        await update.message.reply_text("⚠️ Не удалось получить ответ. Попробуйте позже.")
+    finally:
+        try:
+            await loading_msg.delete()
+        except Exception:
+            pass
 
 # ========== АНАЛИЗ ОПРОСА ЧЕРЕЗ ЧАС ==========
 async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
@@ -478,8 +526,11 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
-        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone.\n"
-        f"Нажмите на кнопку с оружием, чтобы получить актуальную сборку."
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone.\n\n"
+        f"🎯 Нажмите на кнопку с оружием, чтобы получить актуальную сборку.\n"
+        f"💬 <code>/ask вопрос</code> — спросить у ИИ-эксперта по Warzone.\n"
+        f"📊 <code>/poll</code> — запустить опрос вручную.",
+        parse_mode="HTML",
     )
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -518,6 +569,7 @@ if __name__ == "__main__":
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("poll", poll_now))
+    application.add_handler(CommandHandler("ask", ask_command))
     application.add_handler(CallbackQueryHandler(on_weapon_button, pattern=r"^build\|"))
 
     job_queue = application.job_queue
