@@ -48,8 +48,11 @@ BLOG_HEADERS = {
 
 LAST_NEWS_FILE = "last_news.json"
 
-# Глобальный кэш сборок из MetaRadar (заполняется при парсинге меты)
+# Глобальный кэш сборок из MetaRadar
 WEAPON_BUILDS = {}
+
+# Хранилище последнего опроса (message_id) для анализа
+LAST_POLL_MESSAGE_ID = None
 
 # ========== HTTP-СЕРВЕР ДЛЯ RENDER (с HEAD) ==========
 class SimpleHandler(BaseHTTPRequestHandler):
@@ -172,7 +175,6 @@ def parse_warzone_posts_fresh(limit: int = 5):
 def parse_meta_raw():
     """
     Возвращает словарь {категория: [топ-3 оружия]} и заполняет WEAPON_BUILDS.
-    Согласно документации MetaRadar, поле build содержит рекомендованную сборку [citation:1].
     """
     global WEAPON_BUILDS
     try:
@@ -186,7 +188,7 @@ def parse_meta_raw():
             return None
 
         groups = {"Long range": [], "Close range": [], "Sniper": []}
-        WEAPON_BUILDS = {}  # сбрасываем кэш
+        WEAPON_BUILDS = {}
 
         for w in weapons:
             role = (w.get("role") or "").lower()
@@ -194,7 +196,6 @@ def parse_meta_raw():
             if not name:
                 continue
 
-            # Сохраняем сборку из API (поле build)
             build = w.get("build")
             if build:
                 WEAPON_BUILDS[name] = build
@@ -216,7 +217,6 @@ def parse_meta_raw():
         return None
 
 def build_meta_message(groups: dict) -> str:
-    """Собирает HTML-сообщение с жирными названиями оружия."""
     if not groups:
         return "🎯 Мета временно недоступна"
 
@@ -233,14 +233,12 @@ def build_meta_message(groups: dict) -> str:
     return "\n".join(lines)
 
 def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
-    """Создаёт inline-кнопки: одна строка — одна категория, кнопки по оружиям."""
     rows = []
     for key, items in groups.items():
         if not items:
             continue
         row = []
         for name in items:
-            # callback_data ограничен 64 байтами, названия оружия влезают [citation:2][citation:7]
             row.append(InlineKeyboardButton(name, callback_data=f"build|{name}"))
         rows.append(row)
     return InlineKeyboardMarkup(rows)
@@ -248,7 +246,7 @@ def build_meta_keyboard(groups: dict) -> InlineKeyboardMarkup:
 # ========== СБОРКА ИЗ METARADAR (БЕЗ LLM) ==========
 async def get_weapon_build(weapon_name: str) -> str:
     """
-    Возвращает сборку из MetaRadar API (уже сохранённую в WEAPON_BUILDS).
+    Возвращает сборку из MetaRadar API.
     build = {
         "label": "Long range",
         "attachments": [{"slot": "Optic", "name": "Cronen R808"}, ...],
@@ -262,14 +260,12 @@ async def get_weapon_build(weapon_name: str) -> str:
 
     lines = [f"🔫 <b>{weapon_name}</b>"]
 
-    # Роль (Long range / Close range / Sniper)
     label = build.get("label", "")
     if label:
         lines.append(f"🎯 {label}")
 
-    lines.append("")  # пустая строка
+    lines.append("")
 
-    # Аттачменты — каждый с новой строки
     attachments = build.get("attachments", [])
     if isinstance(attachments, list):
         for att in attachments:
@@ -279,12 +275,10 @@ async def get_weapon_build(weapon_name: str) -> str:
                 if name:
                     lines.append(f"• <b>{slot}</b>: {name}")
     elif isinstance(attachments, dict):
-        # на случай, если API вернёт словарь вместо списка
         for slot, name in attachments.items():
             if name:
                 lines.append(f"• <b>{slot}</b>: {name}")
 
-    # Код шаринга
     share_code = build.get("shareCode", "")
     if share_code:
         lines.append("")
@@ -334,6 +328,72 @@ async def get_llm_summary(posts):
         logging.error(f"Ошибка OpenRouter: {e}")
         return None
 
+# ========== АНАЛИЗ ОПРОСА ЧЕРЕЗ ЧАС ==========
+async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
+    """Останавливает опрос и, если голосов >= 5, просит LLM дать комментарий."""
+    global LAST_POLL_MESSAGE_ID
+    if not LAST_POLL_MESSAGE_ID:
+        logging.info("analyze_poll: нет сохранённого message_id опроса")
+        return
+
+    try:
+        poll = await context.bot.stop_poll(
+            chat_id=CHAT_ID,
+            message_id=LAST_POLL_MESSAGE_ID,
+        )
+        total = poll.total_voter_count
+        logging.info(f"Опрос остановлен. Всего голосов: {total}")
+
+        if total < 5:
+            logging.info(f"Голосов меньше 5 ({total}), комментарий не отправляем")
+            LAST_POLL_MESSAGE_ID = None
+            return
+
+        stats_lines = []
+        for opt in poll.options:
+            stats_lines.append(f"— {opt.text}: {opt.voter_count}")
+        stats_text = "\n".join(stats_lines)
+
+        prompt = (
+            "Ты — дружелюбный ассистент игрового чата по Call of Duty: Warzone.\n"
+            f"В опросе «Сегодня играем в WZ?» проголосовало {total} человек:\n"
+            f"{stats_text}\n\n"
+            "Дай ОДИН короткий комментарий (1–2 предложения) на русском.\n"
+            "Если большинство за «20:00» — порадуйся, что состав собирается.\n"
+            "Если большинство за «Нет» или поровну — мягко предложи передумать: "
+            "«может, всё-таки залетите хоть на часок».\n"
+            "ПРАВИЛА:\n"
+            "— Только русский язык.\n"
+            "— Без ссылок.\n"
+            "— Без имён и обращений к конкретным людям.\n"
+            "— Максимум 2 предложения.\n"
+            "— Начни с эмодзи по смыслу.\n"
+        )
+
+        try:
+            response = openrouter_client.chat.completions.create(
+                model="openrouter/free",
+                messages=[
+                    {"role": "system", "content": "Ты отвечаешь ТОЛЬКО на русском языке. Кратко, без ссылок, без имён."},
+                    {"role": "user", "content": prompt},
+                ],
+                timeout=HTTP_TIMEOUT,
+            )
+            comment = response.choices[0].message.content.strip()
+            comment = re.sub(r"https?://\S+", "", comment).strip()
+        except Exception as e:
+            logging.error(f"Ошибка LLM (комментарий к опросу): {e}")
+            comment = ""
+
+        if comment:
+            await context.bot.send_message(chat_id=CHAT_ID, text=comment)
+            logging.info(f"Комментарий к опросу отправлен: {comment[:80]}...")
+
+        LAST_POLL_MESSAGE_ID = None
+
+    except Exception as e:
+        logging.error(f"Ошибка analyze_poll: {e}")
+
 # ========== НАСТРОЙКИ БОТА ==========
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID", 0))
@@ -354,29 +414,25 @@ if not CHAT_ID:
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# ========== ОТПРАВКА МЕТЫ + НОВОСТЕЙ ==========
-async def send_meta_and_news(context_or_update, is_command: bool = False):
+# ========== ОТПРАВКА МЕТЫ + НОВОСТЕЙ + ОПРОСА ==========
+async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
+    global LAST_POLL_MESSAGE_ID
+
     posts = parse_warzone_posts_fresh(limit=5)
     summary = await get_llm_summary(posts)
     groups = parse_meta_raw()
 
-    bot = context_or_update.bot if hasattr(context_or_update, "bot") else context_or_update.get_bot()
-    chat_id = CHAT_ID if not is_command else context_or_update.effective_chat.id
+    bot = context.bot
 
-    # 1. Сообщение с метой и кнопками
+    # 1. Мета с кнопками
     if groups:
         meta_text = build_meta_message(groups)
         keyboard = build_meta_keyboard(groups)
-        await bot.send_message(
-            chat_id=chat_id,
-            text=meta_text,
-            parse_mode="HTML",
-            reply_markup=keyboard,
-        )
+        await bot.send_message(chat_id=chat_id, text=meta_text, parse_mode="HTML", reply_markup=keyboard)
     else:
         await bot.send_message(chat_id=chat_id, text="🎯 Мета временно недоступна")
 
-    # 2. Сообщение с новостями
+    # 2. Новости
     if summary and posts:
         latest_date = posts[0].get("date", "")
         if latest_date:
@@ -388,27 +444,34 @@ async def send_meta_and_news(context_or_update, is_command: bool = False):
             last_date = get_latest_post_date()
             if last_date:
                 save_last_news_date(last_date)
-        if last_date:
-            news_text = f"📰 News: Nothing New (последняя: {last_date})"
-        else:
-            news_text = "📰 News: Nothing New"
-
+        news_text = f"📰 News: Nothing New (последняя: {last_date})" if last_date else "📰 News: Nothing New"
     await bot.send_message(chat_id=chat_id, text=news_text)
 
-    # 3. Опрос (вопрос ограничен 300 символами для ботов) [citation:4][citation:9]
-    await bot.send_poll(
+    # 3. Опрос — сохраняем message_id
+    sent_poll = await bot.send_poll(
         chat_id=chat_id,
         question="Сегодня играем в WZ?",
         options=["✅ 20:00", "❌ Нет"],
         is_anonymous=False,
         allows_multiple_answers=False,
     )
+    LAST_POLL_MESSAGE_ID = sent_poll.message_id
+
+    # 4. Планируем анализ через 1 час
+    if context.job_queue:
+        context.job_queue.run_once(
+            analyze_poll,
+            when=3600,
+            name=f"poll_analysis_{sent_poll.message_id}",
+        )
+        logging.info(f"Анализ опроса запланирован через 1 час (message_id={LAST_POLL_MESSAGE_ID})")
+
     logger.info(f"✅ Мета + новости + опрос отправлены. Мета: {'да' if groups else 'нет'}, Новости: {'да' if summary else 'нет'}")
 
 # ========== ХЕНДЛЕРЫ ==========
 async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
     try:
-        await send_meta_and_news(context, is_command=False)
+        await send_meta_and_news(context, chat_id=CHAT_ID, is_command=False)
     except Exception as e:
         logger.error(f"❌ Ошибка при отправке опроса: {e}")
 
@@ -421,12 +484,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def poll_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
-        await send_meta_and_news(update, is_command=True)
+        await send_meta_and_news(context, chat_id=update.effective_chat.id, is_command=True)
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {e}")
 
 async def on_weapon_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Обработчик нажатия на кнопку с оружием."""
     query = update.callback_query
     await query.answer()
 
@@ -442,10 +504,7 @@ async def on_weapon_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     build = await get_weapon_build(weapon_name)
 
-    await query.message.reply_text(
-        build,
-        parse_mode="HTML",
-    )
+    await query.message.reply_text(build, parse_mode="HTML")
     try:
         await loading_msg.delete()
     except Exception:
