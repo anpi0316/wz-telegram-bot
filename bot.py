@@ -121,9 +121,54 @@ def get_latest_post_date():
             return None
         date_div = first_card.select_one(".news-published")
         if date_div:
-            return date_div.get("data-date")
+            return date_div.get("data-date") or date_div.get_text(strip=True)
     except Exception as e:
         logging.warning(f"Не удалось получить дату последнего поста: {e}")
+    return None
+
+# ========== ПАРСИНГ ДАТЫ (точная или относительная) ==========
+def parse_post_date(card, now):
+    """
+    Возвращает datetime поста или None.
+    Пробует data-date, затем относительный текст ("3 days ago", "yesterday" и т.д.).
+    """
+    date_div = card.select_one(".news-published")
+    if not date_div:
+        return None
+
+    date_str = date_div.get("data-date", "")
+    if date_str:
+        for fmt in ("%B %d, %Y", "%Y-%m-%d", "%d %B %Y", "%b %d, %Y"):
+            try:
+                return datetime.datetime.strptime(date_str, fmt).replace(tzinfo=datetime.timezone.utc)
+            except ValueError:
+                continue
+
+    # Fallback: относительный текст
+    relative_text = date_div.get_text(strip=True).lower()
+    if not relative_text:
+        return None
+
+    if "just now" in relative_text or "только что" in relative_text:
+        return now
+    if "yesterday" in relative_text or "вчера" in relative_text:
+        return now - datetime.timedelta(days=1)
+
+    m = re.search(r"(\d+)\s*(day|hour|minute|week|month)", relative_text)
+    if m:
+        value = int(m.group(1))
+        unit = m.group(2)
+        if unit == "day":
+            return now - datetime.timedelta(days=value)
+        if unit == "hour":
+            return now - datetime.timedelta(hours=value)
+        if unit == "minute":
+            return now - datetime.timedelta(minutes=value)
+        if unit == "week":
+            return now - datetime.timedelta(weeks=value)
+        if unit == "month":
+            return now - datetime.timedelta(days=value * 30)
+
     return None
 
 # ========== ПАРСИНГ БЛОГА (за 24 часа) ==========
@@ -145,24 +190,20 @@ def parse_warzone_posts_fresh(limit: int = 5):
             href = title_tag.get("href", "").strip()
             url = "https://www.callofduty.com" + href if href.startswith("/") else href
 
-            date_div = card.select_one(".news-published")
-            if not date_div:
+            post_date = parse_post_date(card, now)
+            if post_date is None:
                 continue
-            date_str = date_div.get("data-date", "")
-            if not date_str:
-                continue
-
-            try:
-                post_date = datetime.datetime.strptime(date_str, "%B %d, %Y").replace(tzinfo=datetime.timezone.utc)
-                if (now - post_date).total_seconds() > 24 * 3600:
-                    continue
-            except Exception:
+            if (now - post_date).total_seconds() > 24 * 3600:
                 continue
 
             sub = card.select_one(".subtitle")
             summary = sub.get_text(strip=True) if sub else ""
 
-            fresh_posts.append({"title": title, "date": date_str, "summary": summary, "url": url})
+            # Для отображения берём data-date, если есть, иначе относительный текст
+            date_div = card.select_one(".news-published")
+            display_date = date_div.get("data-date") or date_div.get_text(strip=True) if date_div else ""
+
+            fresh_posts.append({"title": title, "date": display_date, "summary": summary, "url": url})
             if len(fresh_posts) >= limit:
                 break
 
@@ -190,12 +231,14 @@ def parse_warzone_posts_latest(limit: int = 5):
             url = "https://www.callofduty.com" + href if href.startswith("/") else href
 
             date_div = card.select_one(".news-published")
-            date_str = date_div.get("data-date", "") if date_div else ""
+            display_date = ""
+            if date_div:
+                display_date = date_div.get("data-date") or date_div.get_text(strip=True)
 
             sub = card.select_one(".subtitle")
             summary = sub.get_text(strip=True) if sub else ""
 
-            posts.append({"title": title, "date": date_str, "summary": summary, "url": url})
+            posts.append({"title": title, "date": display_date, "summary": summary, "url": url})
             if len(posts) >= limit:
                 break
 
@@ -353,7 +396,6 @@ async def get_llm_summary(posts):
 
 # ========== КОМАНДА /ask ==========
 async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Отправляет вопрос в LLM, подмешивая последние посты блога и мету из MetaRadar."""
     question = " ".join(context.args).strip() if context.args else ""
 
     if not question:
@@ -367,7 +409,6 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     loading_msg = await update.message.reply_text("⏳ Думаю над ответом…")
 
-    # 1. Последние посты из блога
     posts = parse_warzone_posts_latest(limit=5)
     news_context = ""
     if posts:
@@ -380,18 +421,13 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     question_lower = question.lower()
 
-    # 2. Если вопрос про мету / пушку — подставляем топ-3 по ролям из META_GROUPS
     meta_keywords = ["мета", "meta", "long range", "close range", "дальн", "ближн",
                      "посоветуй пушку", "какую пушку", "лучшая пушка", "топ пушк",
                      "снайпер", "sniper", "smg", "assault rifle"]
     meta_context = ""
     if any(kw in question_lower for kw in meta_keywords):
         if META_GROUPS:
-            labels = {
-                "Long range": "Long Range",
-                "Close range": "Close Range",
-                "Sniper": "Sniper",
-            }
+            labels = {"Long range": "Long Range", "Close range": "Close Range", "Sniper": "Sniper"}
             meta_lines = []
             for key, items in META_GROUPS.items():
                 if items:
@@ -399,7 +435,6 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if meta_lines:
                 meta_context = "\n".join(meta_lines)
 
-    # 3. Если вопрос про конкретное оружие — подставляем его сборку
     weapon_context = ""
     for weapon_name in WEAPON_BUILDS.keys():
         if weapon_name.lower() in question_lower:
@@ -418,11 +453,9 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     weapon_context += f"\n  Share code: {share}"
             break
 
-    # 4. Текущая дата
     now_msk = datetime.datetime.now(timezone('Europe/Moscow'))
     today_str = now_msk.strftime("%d %B %Y")
 
-    # 5. Формируем промпт (вопрос — в начале, чтобы модель его не теряла)
     prompt = (
         f"Сегодня {today_str} (МСК).\n\n"
         f"ВОПРОС ИГРОКА: {question}\n\n"
@@ -476,15 +509,19 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
     global LAST_POLL_MESSAGE_ID
     if not LAST_POLL_MESSAGE_ID:
+        logging.info("analyze_poll: нет сохранённого message_id опроса")
         return
 
+    message_id = LAST_POLL_MESSAGE_ID
+    LAST_POLL_MESSAGE_ID = None  # сбрасываем сразу, чтобы повторный вызов не сработал
+
     try:
-        poll = await context.bot.stop_poll(chat_id=CHAT_ID, message_id=LAST_POLL_MESSAGE_ID)
+        poll = await context.bot.stop_poll(chat_id=CHAT_ID, message_id=message_id)
         total = poll.total_voter_count
-        logging.info(f"Опрос остановлен. Всего голосов: {total}")
+        logging.info(f"Опрос {message_id} остановлен. Всего голосов: {total}")
 
         if total < 5:
-            LAST_POLL_MESSAGE_ID = None
+            logging.info(f"Голосов меньше 5 ({total}), комментарий не отправляем")
             return
 
         stats_lines = [f"— {opt.text}: {opt.voter_count}" for opt in poll.options]
@@ -517,10 +554,10 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
 
         if comment:
             await context.bot.send_message(chat_id=CHAT_ID, text=comment)
+            logging.info(f"Комментарий к опросу отправлен: {comment[:80]}...")
 
-        LAST_POLL_MESSAGE_ID = None
     except Exception as e:
-        logging.error(f"Ошибка analyze_poll: {e}")
+        logging.warning(f"analyze_poll: не удалось остановить опрос {message_id}: {e}")
 
 # ========== НАСТРОЙКИ БОТА ==========
 TOKEN = os.environ.get("BOT_TOKEN")
@@ -582,7 +619,11 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
     LAST_POLL_MESSAGE_ID = sent_poll.message_id
 
     if context.job_queue:
-        context.job_queue.run_once(analyze_poll, when=3600, name=f"poll_analysis_{sent_poll.message_id}")
+        # Отменяем все старые задачи анализа, чтобы они не закрыли новый опрос
+        for job in context.job_queue.get_jobs_by_name("poll_analysis"):
+            job.schedule_removal()
+        context.job_queue.run_once(analyze_poll, when=3600, name="poll_analysis")
+        logging.info(f"Анализ опроса запланирован через 1 час (message_id={sent_poll.message_id})")
 
     logger.info(f"✅ Мета + новости + опрос отправлены. Мета: {'да' if groups else 'нет'}, Новости: {'да' if summary else 'нет'}")
 
