@@ -116,7 +116,7 @@ def get_latest_post_date():
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        first_card = soup.select_one("div.blog-card-item")
+        first_card = soup.select_one("div.blog-card-item, div.blog-card-lg, div.hero-card, div[class*='blog-card']")
         if not first_card:
             return None
         date_div = first_card.select_one(".news-published")
@@ -128,10 +128,6 @@ def get_latest_post_date():
 
 # ========== ПАРСИНГ ДАТЫ (точная или относительная) ==========
 def parse_post_date(card, now):
-    """
-    Возвращает datetime поста или None.
-    Пробует data-date, затем относительный текст ("3 days ago", "yesterday" и т.д.).
-    """
     date_div = card.select_one(".news-published")
     if not date_div:
         return None
@@ -144,7 +140,6 @@ def parse_post_date(card, now):
             except ValueError:
                 continue
 
-    # Fallback: относительный текст
     relative_text = date_div.get_text(strip=True).lower()
     if not relative_text:
         return None
@@ -171,6 +166,11 @@ def parse_post_date(card, now):
 
     return None
 
+# ========== СЕЛЕКТОР КАРТОЧЕК (расширенный) ==========
+CARD_SELECTOR = (
+    "div.blog-card-item, div.blog-card-lg, div.hero-card, div[class*='blog-card']"
+)
+
 # ========== ПАРСИНГ БЛОГА (за 24 часа) ==========
 def parse_warzone_posts_fresh(limit: int = 5):
     try:
@@ -178,7 +178,7 @@ def parse_warzone_posts_fresh(limit: int = 5):
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
-        cards = soup.select("div.blog-card-item")
+        cards = soup.select(CARD_SELECTOR)
         now = datetime.datetime.now(datetime.timezone.utc)
         fresh_posts = []
 
@@ -199,7 +199,6 @@ def parse_warzone_posts_fresh(limit: int = 5):
             sub = card.select_one(".subtitle")
             summary = sub.get_text(strip=True) if sub else ""
 
-            # Для отображения берём data-date, если есть, иначе относительный текст
             date_div = card.select_one(".news-published")
             display_date = date_div.get("data-date") or date_div.get_text(strip=True) if date_div else ""
 
@@ -219,7 +218,7 @@ def parse_warzone_posts_latest(limit: int = 5):
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-	cards = soup.select("div.blog-card-item, div.blog-card-lg, div.hero-card, div[class*='blog-card']")
+        cards = soup.select(CARD_SELECTOR)
         posts = []
 
         for card in cards:
@@ -513,7 +512,7 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
         return
 
     message_id = LAST_POLL_MESSAGE_ID
-    LAST_POLL_MESSAGE_ID = None  # сбрасываем сразу, чтобы повторный вызов не сработал
+    LAST_POLL_MESSAGE_ID = None
 
     try:
         poll = await context.bot.stop_poll(chat_id=CHAT_ID, message_id=message_id)
@@ -619,7 +618,6 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
     LAST_POLL_MESSAGE_ID = sent_poll.message_id
 
     if context.job_queue:
-        # Отменяем все старые задачи анализа, чтобы они не закрыли новый опрос
         for job in context.job_queue.get_jobs_by_name("poll_analysis"):
             job.schedule_removal()
         context.job_queue.run_once(analyze_poll, when=3600, name="poll_analysis")
