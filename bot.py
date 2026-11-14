@@ -219,7 +219,7 @@ def parse_warzone_posts_latest(limit: int = 5):
         response = httpx.get(WARZONE_BLOG_URL, headers=BLOG_HEADERS, timeout=HTTP_TIMEOUT, follow_redirects=True)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
-        cards = soup.select("div.blog-card-item")
+	cards = soup.select("div.blog-card-item, div.blog-card-lg, div.hero-card, div[class*='blog-card']")
         posts = []
 
         for card in cards:
