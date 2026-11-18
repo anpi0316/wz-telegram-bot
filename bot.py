@@ -504,7 +504,7 @@ async def ask_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ========== АНАЛИЗ ОПРОСА ЧЕРЕЗ ЧАС ==========
+# ========== АНАЛИЗ ОПРОСА (ЕЖЕДНЕВНО В 19:30 МИНСК) ==========
 async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
     global LAST_POLL_MESSAGE_ID
     if not LAST_POLL_MESSAGE_ID:
@@ -512,7 +512,7 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
         return
 
     message_id = LAST_POLL_MESSAGE_ID
-    LAST_POLL_MESSAGE_ID = None
+    LAST_POLL_MESSAGE_ID = None  # сбрасываем, чтобы не закрыть дважды
 
     try:
         poll = await context.bot.stop_poll(chat_id=CHAT_ID, message_id=message_id)
@@ -532,7 +532,8 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
             f"{stats_text}\n\n"
             "Дай ОДИН короткий комментарий (1–2 предложения) на русском.\n"
             "Если большинство за «20:00» — порадуйся, что состав собирается.\n"
-            "Если большинство за «Нет» или поровну — мягко предложи передумать.\n"
+            "Если большинство за «Нет» или поровну — мягко предложи передумать: "
+            "«может, всё-таки залетите хоть на часок».\n"
             "ПРАВИЛА: только русский, без ссылок, без имён, максимум 2 предложения, начни с эмодзи."
         )
 
@@ -561,13 +562,13 @@ async def analyze_poll(context: ContextTypes.DEFAULT_TYPE):
 # ========== НАСТРОЙКИ БОТА ==========
 TOKEN = os.environ.get("BOT_TOKEN")
 CHAT_ID = int(os.environ.get("CHAT_ID", 0))
-ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "20:00")
+ВРЕМЯ_ОТПРАВКИ_STR = os.environ.get("POLL_TIME", "12:45")
 
 try:
     час, минута = map(int, ВРЕМЯ_ОТПРАВКИ_STR.split(':'))
     ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=час, minute=минута, tzinfo=timezone('Europe/Moscow'))
 except Exception:
-    ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=20, minute=0, tzinfo=timezone('Europe/Moscow'))
+    ВРЕМЯ_ОТПРАВКИ = datetime.time(hour=12, minute=45, tzinfo=timezone('Europe/Moscow'))
 
 if not TOKEN:
     raise ValueError("❌ BOT_TOKEN не задан!")
@@ -616,12 +617,7 @@ async def send_meta_and_news(context, chat_id: int, is_command: bool = False):
         allows_multiple_answers=False,
     )
     LAST_POLL_MESSAGE_ID = sent_poll.message_id
-
-    if context.job_queue:
-        for job in context.job_queue.get_jobs_by_name("poll_analysis"):
-            job.schedule_removal()
-        context.job_queue.run_once(analyze_poll, when=3600, name="poll_analysis")
-        logging.info(f"Анализ опроса запланирован через 1 час (message_id={sent_poll.message_id})")
+    logger.info(f"Опрос {sent_poll.message_id} отправлен. Анализ — ежедневно в 19:30 Минск.")
 
     logger.info(f"✅ Мета + новости + опрос отправлены. Мета: {'да' if groups else 'нет'}, Новости: {'да' if summary else 'нет'}")
 
@@ -635,7 +631,8 @@ async def send_daily_poll(context: ContextTypes.DEFAULT_TYPE):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"👋 Бот для ежедневных опросов!\n"
-        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone.\n\n"
+        f"Каждый день в {ВРЕМЯ_ОТПРАВКИ_STR} будет опрос с метой и новостями Warzone.\n"
+        f"Итоги опроса подводятся в 19:30 (Минск).\n\n"
         f"🎯 Нажмите на кнопку с оружием, чтобы получить актуальную сборку.\n"
         f"💬 <code>/ask вопрос</code> — спросить у ИИ-эксперта по Warzone.\n"
         f"📊 <code>/poll</code> — запустить опрос вручную.",
@@ -682,7 +679,19 @@ if __name__ == "__main__":
     application.add_handler(CallbackQueryHandler(on_weapon_button, pattern=r"^build\|"))
 
     job_queue = application.job_queue
+
+    # 1. Ежедневный опрос в 12:45 (МСК)
     job_queue.run_daily(send_daily_poll, time=ВРЕМЯ_ОТПРАВКИ, days=tuple(range(7)))
 
-    logger.info("🚀 Бот запущен!")
+    # 2. Ежедневный анализ опроса в 19:30 (Минск) — за 30 минут до игры
+    minsk_tz = timezone('Europe/Minsk')
+    analyze_time = datetime.time(hour=19, minute=30, tzinfo=minsk_tz)
+    job_queue.run_daily(
+        analyze_poll,
+        time=analyze_time,
+        days=tuple(range(7)),
+        name="daily_poll_analysis",
+    )
+
+    logger.info("🚀 Бот запущен! Опрос в 12:45 (МСК), анализ в 19:30 (Минск)")
     application.run_polling()
